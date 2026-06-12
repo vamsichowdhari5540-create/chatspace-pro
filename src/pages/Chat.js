@@ -1,0 +1,1577 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { io } from 'socket.io-client';
+import axios from 'axios';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  Hash, Plus, Search, Sun, Moon, LogOut,
+  Send, Paperclip, Smile, Reply, X,
+  Users, Info, CheckCheck, Shield,
+  Phone, Video, PhoneOff, VideoOff, Mic, MicOff,
+  PhoneMissed, Edit2, Trash2, Forward, Pin,
+  Bell, BellOff, UserX, UserCheck, Clock,
+  Check, User, Save, Settings
+} from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import { useTheme } from '../context/ThemeContext';
+import { useToast } from '../context/ToastContext';
+import EmojiPicker from 'emoji-picker-react';
+
+const API = 'http://localhost:5000/api';
+const formatUID = (id) => {
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const letterIndex = Math.floor((id - 1) / 9999) % 26;
+  const letter = letters[letterIndex];
+  return `CSP-${letter}-${String(id).padStart(6,'0')}`;
+};
+const CHANNELS = ['announcements', 'tech-updates', 'job-notifications'];
+let socket;
+
+const STATUS_CONFIG = {
+  online: { color: 'status-online', label: 'Online', text: 'text-green-400', hex: '#22c55e' },
+  away:   { color: 'status-away',   label: 'Away',   text: 'text-yellow-400', hex: '#f59e0b' },
+  busy:   { color: 'status-busy',   label: 'Busy',   text: 'text-red-400', hex: '#ef4444' },
+  dnd:    { color: 'status-dnd',    label: 'Do Not Disturb', text: 'text-purple-400', hex: '#8b5cf6' },
+};
+
+// ── STARS BACKGROUND ──
+const StarsBackground = () => {
+  const canvasRef = useRef();
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    let W = canvas.width = window.innerWidth;
+    let H = canvas.height = window.innerHeight;
+    const stars = Array.from({ length: 180 }, () => ({
+      x: Math.random() * W, y: Math.random() * H,
+      size: Math.random() * 1.8 + 0.3,
+      opacity: Math.random() * 0.6 + 0.1,
+      speed: 0.5 + Math.random() * 2,
+      offset: Math.random() * Math.PI * 2,
+    }));
+    let frame = 0;
+    let animId;
+    const draw = () => {
+      ctx.clearRect(0, 0, W, H);
+      frame++;
+      stars.forEach(s => {
+        const twinkle = 0.5 + 0.5 * Math.sin(frame * 0.015 * s.speed + s.offset);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.size, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255,255,255,${s.opacity * twinkle})`;
+        ctx.fill();
+      });
+      animId = requestAnimationFrame(draw);
+    };
+    draw();
+    const onResize = () => { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; };
+    window.addEventListener('resize', onResize);
+    return () => { cancelAnimationFrame(animId); window.removeEventListener('resize', onResize); };
+  }, []);
+  return <canvas ref={canvasRef} className="stars-canvas" />;
+};
+
+// ── AVATAR ──
+const Avatar = ({ user, size = 38, showStatus = false }) => {
+  const s = user?.status || 'online';
+  return (
+    <div className="relative flex-shrink-0" style={{ width: size, height: size }}>
+      {user?.avatar_url ? (
+        <img src={`http://localhost:5000${user.avatar_url}`} alt=""
+          className="rounded-full object-cover w-full h-full avatar-ring" />
+      ) : (
+        <div className="rounded-full flex items-center justify-center text-white font-bold w-full h-full"
+          style={{ background: user?.avatar_color || '#4A90E2', fontSize: size * 0.38 }}>
+          {(user?.username?.[0] || '?').toUpperCase()}
+        </div>
+      )}
+      {showStatus && (
+        <div className={`absolute bottom-0 right-0 rounded-full border-2 ${STATUS_CONFIG[s]?.color || 'status-offline'}`}
+          style={{ width: size * 0.28, height: size * 0.28, borderColor: 'rgba(3,8,25,0.95)' }} />
+      )}
+    </div>
+  );
+};
+
+const TypingIndicator = ({ username }) => (
+  <div className="flex items-center gap-2 px-4 py-1">
+    <div className="flex gap-1 px-3 py-2 rounded-2xl" style={{ background:'rgba(74,144,226,0.1)', border:'1px solid rgba(74,144,226,0.2)' }}>
+      {[0,1,2].map(i => <div key={i} className="w-2 h-2 rounded-full typing-dot" style={{ background:'#4A90E2', animationDelay:`${i*0.2}s` }} />)}
+    </div>
+    <span className="text-xs" style={{ color:'rgba(150,180,255,0.6)' }}>{username} is typing...</span>
+  </div>
+);
+
+const IncomingCall = ({ caller, callType, onAccept, onReject }) => (
+  <motion.div initial={{ opacity:0, y:-50 }} animate={{ opacity:1, y:0 }} exit={{ opacity:0, y:-50 }}
+    className="fixed top-4 left-1/2 -translate-x-1/2 z-50 modal-card rounded-2xl p-5 shadow-2xl w-80">
+    <div className="flex flex-col items-center gap-4">
+      <div className="relative">
+        <Avatar user={caller} size={64} />
+        <motion.div animate={{ scale:[1,1.3,1] }} transition={{ repeat:Infinity, duration:1.5 }}
+          className="absolute inset-0 rounded-full border-2 opacity-50" style={{ borderColor:'#22c55e' }} />
+      </div>
+      <div className="text-center">
+        <p className="font-bold text-white text-lg">{caller?.username}</p>
+        <p className="text-xs mt-1" style={{ color:'rgba(150,180,255,0.6)' }}>{callType==='video'?'📹 Incoming video call...':'📞 Incoming voice call...'}</p>
+      </div>
+      <div className="flex gap-4">
+        <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={onReject}
+          className="w-14 h-14 rounded-full flex items-center justify-center"
+          style={{ background:'#ef4444', boxShadow:'0 4px 20px rgba(239,68,68,0.5)' }}>
+          <PhoneOff size={22} className="text-white" />
+        </motion.button>
+        <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={onAccept}
+          className="w-14 h-14 rounded-full flex items-center justify-center"
+          style={{ background:'#22c55e', boxShadow:'0 4px 20px rgba(34,197,94,0.5)' }}>
+          <Phone size={22} className="text-white" />
+        </motion.button>
+      </div>
+    </div>
+  </motion.div>
+);
+
+const ActiveCall = ({ callType, remoteUser, onEnd, localVideoRef, remoteVideoRef, onScreenShare, screenSharing }) => {
+  const [duration, setDuration] = useState(0);
+  const [muted, setMuted] = useState(false);
+  const [videoOff, setVideoOff] = useState(false);
+  useEffect(() => { const t = setInterval(() => setDuration(d=>d+1), 1000); return () => clearInterval(t); }, []);
+  const fmt = s => `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+  return (
+    <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} exit={{ opacity:0 }}
+      className="fixed inset-0 z-50 flex flex-col items-center justify-between py-10"
+      style={{ background:'linear-gradient(135deg, #010a1e, #021030, #050e28)' }}>
+      {callType==='video' && (
+        <div className="absolute inset-0">
+          <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover opacity-80" />
+          <div className="absolute inset-0" style={{ background:'linear-gradient(to bottom, rgba(0,0,0,0.3), transparent, rgba(0,0,0,0.6))' }} />
+        </div>
+      )}
+      <div className="relative z-10 flex flex-col items-center gap-3 mt-8">
+        <Avatar user={remoteUser} size={80} />
+        <h2 className="text-2xl font-bold text-white">{remoteUser?.username}</h2>
+        <p className="font-mono text-sm" style={{ color:'#22c55e' }}>{fmt(duration)}</p>
+        {screenSharing && <span className="text-xs px-3 py-1 rounded-full" style={{ background:'rgba(74,144,226,0.3)', color:'#4A90E2', border:'1px solid rgba(74,144,226,0.5)' }}>📺 Sharing screen</span>}
+      </div>
+      {callType==='video' && (
+        <div className="absolute top-4 right-4 w-32 h-44 rounded-xl overflow-hidden z-10" style={{ border:'2px solid rgba(74,144,226,0.4)' }}>
+          <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+        </div>
+      )}
+      <div className="relative z-10 flex items-center gap-4 mb-4 flex-wrap justify-center px-4">
+        <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={() => setMuted(!muted)}
+          className="w-13 h-13 rounded-full flex items-center justify-center transition-all"
+          style={{ width:52, height:52, background: muted ? '#ef4444' : 'rgba(255,255,255,0.15)' }}>
+          {muted ? <MicOff size={20} className="text-white" /> : <Mic size={20} className="text-white" />}
+        </motion.button>
+        {callType==='video' && (
+          <>
+            <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={() => setVideoOff(!videoOff)}
+              className="rounded-full flex items-center justify-center transition-all"
+              style={{ width:52, height:52, background: videoOff ? '#ef4444' : 'rgba(255,255,255,0.15)' }}>
+              {videoOff ? <VideoOff size={20} className="text-white" /> : <Video size={20} className="text-white" />}
+            </motion.button>
+            <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={onScreenShare}
+              className="rounded-full flex items-center justify-center transition-all"
+              title="Screen Share"
+              style={{ width:52, height:52, background: screenSharing ? 'rgba(74,144,226,0.8)' : 'rgba(255,255,255,0.15)', border: screenSharing ? '2px solid #4A90E2' : 'none' }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+              </svg>
+            </motion.button>
+          </>
+        )}
+        <motion.button whileHover={{ scale:1.05 }} whileTap={{ scale:0.95 }} onClick={onEnd}
+          className="rounded-full flex items-center justify-center"
+          style={{ width:60, height:60, background:'#ef4444', boxShadow:'0 4px 25px rgba(239,68,68,0.6)' }}>
+          <PhoneOff size={24} className="text-white" />
+        </motion.button>
+      </div>
+    </motion.div>
+  );
+};
+
+export default function Chat() {
+  const { user, logout, updateAvatar, setUser } = useAuth();
+  const { dark, toggle } = useTheme();
+  const { addToast } = useToast();
+
+  const [activeChannel, setActiveChannel] = useState('announcements');
+  const [activeDM, setActiveDM] = useState(null);
+  const [activeGroup, setActiveGroup] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [groups, setGroups] = useState([]);
+  const [onlineUsers, setOnlineUsers] = useState([]);
+  const [input, setInput] = useState('');
+  const [typingUsers, setTypingUsers] = useState([]);
+  const [replyTo, setReplyTo] = useState(null);
+  const [showEmoji, setShowEmoji] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showInfo, setShowInfo] = useState(false);
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [showAdminPanel, setShowAdminPanel] = useState(false);
+  const [showAccount, setShowAccount] = useState(false);
+  const [groupName, setGroupName] = useState('');
+  const [groupMembers, setGroupMembers] = useState('');
+  const [groupError, setGroupError] = useState('');
+  const [groupMemberSearch, setGroupMemberSearch] = useState('');
+  const [selectedGroupMembers, setSelectedGroupMembers] = useState([]);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [groupMembersList, setGroupMembersList] = useState([]);
+  const [reactions, setReactions] = useState({});
+  const [addMemberInput, setAddMemberInput] = useState('');
+  const [adminError, setAdminError] = useState('');
+  const [pinnedMessages, setPinnedMessages] = useState([]);
+  const [editingMsg, setEditingMsg] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [forwardMsg, setForwardMsg] = useState(null);
+  const [blockedUsers, setBlockedUsers] = useState([]);
+  const [notifEnabled, setNotifEnabled] = useState(true);
+  const [accountForm, setAccountForm] = useState({ username:'', bio:'', avatar_color:'', status:'online' });
+  const [accountSaving, setAccountSaving] = useState(false);
+  const [accountError, setAccountError] = useState('');
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [activeCall, setActiveCall] = useState(null);
+  const [callLoading, setCallLoading] = useState(false);
+  const [screenSharing, setScreenSharing] = useState(false);
+  const screenStreamRef = useRef(null);
+  const [canPost, setCanPost] = useState(true);
+  const [showAdminUsers, setShowAdminUsers] = useState(false);
+  const [adminUsers, setAdminUsers] = useState([]);
+  const [allPermissions, setAllPermissions] = useState([]);
+  const [selectedUser, setSelectedUser] = useState(null);
+  const [userPermissions, setUserPermissions] = useState([]);
+  const [adminSearch, setAdminSearch] = useState('');
+  const [imageViewer, setImageViewer] = useState(null); // { src, zoom }
+
+  const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const avatarInputRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+  const missedCallTimerRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+  const cleanupCall = useCallback(() => {
+    if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
+    if (peerConnectionRef.current) { peerConnectionRef.current.close(); peerConnectionRef.current = null; }
+    clearTimeout(missedCallTimerRef.current);
+    setActiveCall(null); setIncomingCall(null); setCallLoading(false);
+  }, []);
+
+  const sendMissedCallMessage = useCallback(async (toUserId, callType) => {
+    const text = callType==='video' ? '📹 Missed video call' : '📞 Missed voice call';
+    try {
+      const r = await axios.post(`${API}/messages/private`, { to_user_id: toUserId, text });
+      socket.emit('sendPrivateMessage', { ...r.data, avatar_color: user.avatar_color });
+      setMessages(prev => [...prev, { ...r.data, username: user.username, avatar_color: user.avatar_color }]);
+    } catch {}
+  }, [user]);
+
+  useEffect(() => {
+    if ('Notification' in window && Notification.permission==='default') Notification.requestPermission();
+  }, []);
+
+  const showPushNotif = (title, body) => {
+    if (!notifEnabled) return;
+    if ('Notification' in window && Notification.permission==='granted' && document.hidden)
+      new Notification(title, { body, icon: '/logo192.png' });
+  };
+
+  useEffect(() => {
+    socket = io('http://localhost:5000');
+    socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
+    socket.on('onlineUsers', setOnlineUsers);
+    socket.on('newMessage', msg => {
+      setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+      if (msg.user_id!==user.id) { addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} }); showPushNotif(msg.username, msg.text?.substring(0,60)||'📷'); }
+    });
+    socket.on('newPrivateMessage', msg => {
+      setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+      if (msg.from_user_id!==user.id) { addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} }); showPushNotif(msg.username, msg.text?.substring(0,60)||'📷'); }
+    });
+    socket.on('newGroupMessage', msg => { setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]); });
+    socket.on('userTyping', ({ username, isTyping }) => { setTypingUsers(prev => isTyping ? [...prev.filter(u=>u!==username),username] : prev.filter(u=>u!==username)); });
+    socket.on('messageReaction', ({ messageId, reactions:r }) => { setReactions(prev => ({...prev,[messageId]:r})); });
+    socket.on('messageEdited', ({ id, text }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text,edited:1}:m)); });
+    socket.on('messageDeleted', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text:'This message was deleted',deleted:1}:m)); });
+    socket.on('messageSeen', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,seen_at:new Date()}:m)); });
+    socket.on('incomingCall', ({ from, fromUser, callType, offer }) => {
+      setIncomingCall({ from, fromUser, callType, offer });
+      missedCallTimerRef.current = setTimeout(() => { socket.emit('rejectCall', { to:from, toUserId:fromUser.id, fromUser:user }); setIncomingCall(null); }, 30000);
+    });
+    socket.on('callAccepted', async ({ answer }) => { if (peerConnectionRef.current) { await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer)); setCallLoading(false); } });
+    socket.on('callRejected', () => { cleanupCall(); addToast({ title:'Call declined', message:'The user rejected your call' }); });
+    socket.on('callEnded', () => { cleanupCall(); });
+    socket.on('iceCandidate', async ({ candidate }) => { if (peerConnectionRef.current && candidate) { try { await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch {} } });
+    socket.on('missedCallMessage', async ({ fromUser }) => {
+      try { const r = await axios.post(`${API}/messages/private`, { to_user_id:fromUser.id, text:'📞 Missed voice call' }); setMessages(prev => [...prev, { ...r.data, username:user.username, avatar_color:user.avatar_color }]); } catch {}
+    });
+    loadUsers(); loadGroups(); loadMessages('channel','announcements');
+    // Check if user can post in default channel
+    if (user.role !== 'admin') {
+      axios.get(`${API}/admin/can-post/announcements`).then(r => setCanPost(r.data.canPost)).catch(() => {});
+    } else {
+      setCanPost(true);
+    }
+    loadBlockedUsers();
+    window.addEventListener('beforeunload', () => axios.put(`${API}/users/last-seen`));
+    return () => { socket.disconnect(); cleanupCall(); };
+  }, []);
+
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages]);
+
+  useEffect(() => {
+    if (activeDM) {
+      messages.filter(m=>m.from_user_id===activeDM.id && !m.seen_at).forEach(async m => {
+        try { await axios.put(`${API}/messages/private/${m.id}/seen`); socket.emit('messageSeen', { id:m.id, to:activeDM.id }); } catch {}
+      });
+    }
+  }, [messages, activeDM]);
+
+  const loadUsers = async () => { try { const r = await axios.get(`${API}/users`); setUsers(r.data); } catch {} };
+  const loadGroups = async () => { try { const r = await axios.get(`${API}/groups`); setGroups(r.data); } catch {} };
+  const loadBlockedUsers = async () => { try { const r = await axios.get(`${API}/users/blocked`); setBlockedUsers(r.data); } catch {} };
+
+  const loadAdminUsers = async () => {
+    try {
+      const [usersRes, permsRes] = await Promise.all([
+        axios.get(`${API}/admin/users`),
+        axios.get(`${API}/admin/permissions`)
+      ]);
+      setAdminUsers(usersRes.data);
+      setAllPermissions(permsRes.data);
+    } catch(err) {
+      console.error('loadAdminUsers error:', err.response?.data || err.message);
+    }
+  };
+
+  const handleSetRole = async (userId, role) => {
+    try {
+      await axios.put(`${API}/admin/users/${userId}/role`, { role });
+      loadAdminUsers();
+      addToast({ title:'Role updated!', message:`User role set to ${role}` });
+    } catch(err) { addToast({ title:'Error', message: err.response?.data?.message || 'Failed' }); }
+  };
+
+  const handleGrantPermission = async (userId, channel) => {
+    try {
+      await axios.post(`${API}/admin/permissions`, { user_id: userId, channel });
+      loadAdminUsers();
+      addToast({ title:'Permission granted!', message:`Can now post in ${channel}` });
+    } catch {}
+  };
+
+  const handleRevokePermission = async (userId, channel) => {
+    try {
+      await axios.delete(`${API}/admin/permissions`, { data: { user_id: userId, channel } });
+      loadAdminUsers();
+      addToast({ title:'Permission revoked!', message:'' });
+    } catch {}
+  };
+
+  const loadMessages = async (type, id) => {
+    try {
+      setMessages([]);
+      let r;
+      if (type==='channel') { r = await axios.get(`${API}/messages/${id}`); socket.emit('joinRoom',id); }
+      else if (type==='dm') { r = await axios.get(`${API}/messages/private/${id}`); }
+      else { r = await axios.get(`${API}/groups/${id}/messages`); socket.emit('joinGroup',id); }
+      setMessages(r.data);
+    } catch {}
+  };
+
+  const switchChannel = async ch => {
+    setActiveChannel(ch); setActiveDM(null); setActiveGroup(null); loadMessages('channel',ch);
+    // Admin can always post
+    if (user.role === 'admin') { setCanPost(true); return; }
+    try {
+      const r = await axios.get(`${API}/admin/can-post/${ch}`);
+      setCanPost(r.data.canPost);
+    } catch { setCanPost(true); }
+  };
+  const switchDM = u => { setActiveDM(u); setActiveChannel(null); setActiveGroup(null); loadMessages('dm',u.id); };
+  const switchGroup = async g => {
+    setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group',g.id);
+    try {
+      const [members,pinned] = await Promise.all([axios.get(`${API}/groups/${g.id}/members`), axios.get(`${API}/groups/${g.id}/pinned`)]);
+      setGroupMembersList(members.data); setPinnedMessages(pinned.data);
+    } catch {}
+  };
+
+  const sendMessage = async () => {
+    if (!input.trim()) return;
+    const text = input.trim();
+    setInput(''); setReplyTo(null); setShowEmoji(false);
+    try {
+      if (activeDM) { const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text }); socket.emit('sendPrivateMessage', { ...r.data, avatar_color:user.avatar_color }); }
+      else if (activeGroup) { const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text }); socket.emit('sendGroupMessage', { ...r.data, avatar_color:user.avatar_color }); }
+      else { const r = await axios.post(`${API}/messages`, { room:activeChannel, text }); socket.emit('sendMessage', { ...r.data, room:activeChannel, avatar_color:user.avatar_color }); }
+    } catch {}
+  };
+
+  const handleTyping = e => {
+    setInput(e.target.value);
+    if (activeChannel) {
+      socket.emit('typing', { room:activeChannel, username:user.username, isTyping:true });
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = setTimeout(() => socket.emit('typing', { room:activeChannel, username:user.username, isTyping:false }), 1500);
+    }
+  };
+
+  const handleImageUpload = async e => {
+    const file = e.target.files[0]; if (!file) return;
+    e.target.value = '';
+    try {
+      const fd = new FormData();
+      fd.append('image', file);
+      const r = await axios.post(`${API}/messages/upload-image`, fd);
+      const imageUrl = `http://localhost:5000${r.data.image_url}`;
+      const text = `[IMAGE]${imageUrl}[/IMAGE]`;
+
+      if (activeDM) {
+        const mr = await axios.post(`${API}/messages/private`, { to_user_id: activeDM.id, text });
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        if (socket) socket.emit('sendPrivateMessage', { ...finalMsg, to_user_id: activeDM.id });
+        setMessages(prev => [...prev, finalMsg]);
+      } else if (activeGroup) {
+        const mr = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text });
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        if (socket) socket.emit('sendGroupMessage', { ...finalMsg, group_id: activeGroup.id });
+        setMessages(prev => [...prev, finalMsg]);
+      } else if (activeChannel) {
+        const mr = await axios.post(`${API}/messages`, { room: activeChannel, text });
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        if (socket) socket.emit('sendMessage', { ...finalMsg, room: activeChannel });
+        setMessages(prev => [...prev, finalMsg]);
+      }
+    } catch(err) {
+      console.error('Image send error:', err.response?.data || err.message);
+      addToast({ title:'Upload failed', message: err.response?.data?.message || 'Could not send image' });
+    }
+  };
+
+  const handleEditMessage = async () => {
+    if (!editingMsg || !editText.trim()) return;
+    try {
+      if (editingMsg.type==='private') await axios.put(`${API}/messages/private/${editingMsg.id}`, { text:editText });
+      else if (editingMsg.type==='group') await axios.put(`${API}/groups/${activeGroup.id}/messages/${editingMsg.id}`, { text:editText });
+      else await axios.put(`${API}/messages/${editingMsg.id}`, { text:editText });
+      socket.emit('editMessage', { id:editingMsg.id, text:editText });
+      setMessages(prev => prev.map(m=>m.id===editingMsg.id?{...m,text:editText,edited:1}:m));
+      setEditingMsg(null); setEditText('');
+    } catch {}
+  };
+
+  const handleDeleteMessage = async (msg) => {
+    try {
+      if (activeDM) await axios.delete(`${API}/messages/private/${msg.id}`);
+      else if (activeGroup) await axios.delete(`${API}/groups/${activeGroup.id}/messages/${msg.id}`);
+      else await axios.delete(`${API}/messages/${msg.id}`);
+      socket.emit('deleteMessage', { id:msg.id });
+      setMessages(prev => prev.map(m=>m.id===msg.id?{...m,text:'This message was deleted',deleted:1}:m));
+    } catch {}
+    setContextMenu(null);
+  };
+
+  const handleForward = async (targetUserId) => {
+    if (!forwardMsg) return;
+    try {
+      const r = await axios.post(`${API}/messages/private`, { to_user_id:targetUserId, text:`↩ Forwarded: ${forwardMsg.text}` });
+      socket.emit('sendPrivateMessage', { ...r.data, avatar_color:user.avatar_color });
+      addToast({ title:'Message forwarded!', message:'' });
+    } catch {}
+    setForwardMsg(null);
+  };
+
+  const handlePinMessage = async (msg) => {
+    if (!activeGroup || activeGroup.admin_id!==user.id) return;
+    try { await axios.post(`${API}/groups/${activeGroup.id}/pin/${msg.id}`); setPinnedMessages(prev=>[...prev,msg]); addToast({ title:'Message pinned!', message:'' }); } catch {}
+    setContextMenu(null);
+  };
+
+  const handleBlock = async (userId) => {
+    try { await axios.post(`${API}/users/block/${userId}`); loadBlockedUsers(); loadUsers(); addToast({ title:'User blocked', message:'' }); } catch {}
+    setContextMenu(null);
+  };
+
+  const handleUnblock = async (userId) => {
+    try { await axios.delete(`${API}/users/block/${userId}`); loadBlockedUsers(); loadUsers(); addToast({ title:'User unblocked', message:'' }); } catch {}
+  };
+
+  const handleSaveAccount = async () => {
+    setAccountSaving(true); setAccountError('');
+    try {
+      await axios.put(`${API}/users/me`, accountForm);
+      setUser(prev => ({...prev,...accountForm}));
+      socket.emit('userOnline', { id:user.id, username:accountForm.username, avatar_color:accountForm.avatar_color, status:accountForm.status });
+      await axios.put(`${API}/users/status`, { status:accountForm.status });
+      addToast({ title:'Profile saved!', message:'' });
+    } catch (err) { setAccountError(err.response?.data?.message||'Failed to save'); }
+    setAccountSaving(false);
+  };
+
+  const openAccount = () => {
+    setAccountForm({ username:user.username, bio:user.bio||'', avatar_color:user.avatar_color||'#4A90E2', status:user.status||'online' });
+    setShowAccount(true);
+  };
+
+  const startCall = async (callType) => {
+    if (!activeDM) return;
+    setCallLoading(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(callType==='video'?{video:true,audio:true}:{audio:true});
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      const pc = new RTCPeerConnection(rtcConfig);
+      peerConnectionRef.current = pc;
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      pc.ontrack = e => { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0]; };
+      pc.onicecandidate = e => { if (e.candidate) socket.emit('iceCandidate', { to:activeDM._socketId, candidate:e.candidate }); };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const toUser = onlineUsers.find(u=>u.id===activeDM.id);
+      if (!toUser) { await sendMissedCallMessage(activeDM.id, callType); cleanupCall(); return; }
+      activeDM._socketId = toUser.socketId;
+      socket.emit('callUser', { toUserId:activeDM.id, callType, fromUser:{ id:user.id, username:user.username, avatar_color:user.avatar_color }, offer });
+      setActiveCall({ callType, remoteUser:activeDM });
+      missedCallTimerRef.current = setTimeout(async () => {
+        if (peerConnectionRef.current) { socket.emit('missedCall', { to:toUser.socketId, fromUser:user }); await sendMissedCallMessage(activeDM.id, callType); cleanupCall(); }
+      }, 30000);
+    } catch { cleanupCall(); addToast({ title:'Call failed', message:'Could not access camera/microphone' }); }
+  };
+
+  const acceptCall = async () => {
+    if (!incomingCall) return;
+    clearTimeout(missedCallTimerRef.current);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(incomingCall.callType==='video'?{video:true,audio:true}:{audio:true});
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      const pc = new RTCPeerConnection(rtcConfig);
+      peerConnectionRef.current = pc;
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      pc.ontrack = e => { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0]; };
+      pc.onicecandidate = e => { if (e.candidate) socket.emit('iceCandidate', { to:incomingCall.from, candidate:e.candidate }); };
+      await pc.setRemoteDescription(new RTCSessionDescription(incomingCall.offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('acceptCall', { to:incomingCall.from, answer });
+      setActiveCall({ callType:incomingCall.callType, remoteUser:incomingCall.fromUser });
+      setIncomingCall(null);
+    } catch { cleanupCall(); }
+  };
+
+  const rejectCall = () => {
+    clearTimeout(missedCallTimerRef.current);
+    socket.emit('rejectCall', { to:incomingCall.from, toUserId:incomingCall.fromUser.id, fromUser:user });
+    setIncomingCall(null);
+  };
+
+  const endCall = () => { if (activeCall) socket.emit('callEnded', { to:activeDM?._socketId||'' }); cleanupCall(); };
+  // ── SCREEN SHARE ──
+  const toggleScreenShare = async () => {
+    if (screenSharing) {
+      // Stop screen share
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(t => t.stop());
+        screenStreamRef.current = null;
+      }
+      // Restore camera
+      if (localStreamRef.current && peerConnectionRef.current) {
+        const videoTrack = localStreamRef.current.getVideoTracks()[0];
+        if (videoTrack) {
+          const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video');
+          if (sender) sender.replaceTrack(videoTrack);
+        }
+      }
+      setScreenSharing(false);
+    } else {
+      try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        screenStreamRef.current = screenStream;
+        const screenTrack = screenStream.getVideoTracks()[0];
+        // Replace video track in peer connection
+        if (peerConnectionRef.current) {
+          const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video');
+          if (sender) sender.replaceTrack(screenTrack);
+        }
+        // Show screen in local video
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = screenStream;
+        }
+        screenTrack.onended = () => {
+          setScreenSharing(false);
+          screenStreamRef.current = null;
+          // Restore camera track
+          if (localStreamRef.current && peerConnectionRef.current) {
+            const videoTrack = localStreamRef.current.getVideoTracks()[0];
+            if (videoTrack) {
+              const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video');
+              if (sender) sender.replaceTrack(videoTrack);
+            }
+          }
+        };
+        setScreenSharing(true);
+      } catch(e) {
+        if (e.name !== 'NotAllowedError') addToast({ title:'Screen share failed', message:e.message });
+      }
+    }
+  };
+
+  const handleReaction = (msgId, emoji) => { socket.emit('addReaction', { messageId:msgId, emoji, userId:user.id, username:user.username }); setContextMenu(null); };
+  const handleContextMenu = (e, msg) => { e.preventDefault(); setContextMenu({ x:e.clientX, y:e.clientY, msg }); };
+
+  const handleCreateGroup = async () => {
+    if (!groupName.trim()) { setGroupError('Enter a group name'); return; }
+    if (!selectedGroupMembers.length) { setGroupError('Add at least one member'); return; }
+    try {
+      const memberUsernames = selectedGroupMembers.map(m => m.username);
+      await axios.post(`${API}/groups`, { name:groupName, memberUsernames });
+      setShowCreateGroup(false);
+      setGroupName('');
+      setGroupMembers('');
+      setGroupError('');
+      setSelectedGroupMembers([]);
+      setGroupMemberSearch('');
+      loadGroups();
+    }
+    catch (err) { setGroupError(err.response?.data?.message || 'Failed to create group'); }
+  };
+
+  const handleAddMember = async () => {
+    if (!addMemberInput.trim()) return;
+    try { await axios.post(`${API}/groups/${activeGroup.id}/members`, { username:addMemberInput }); setAddMemberInput(''); setAdminError(''); const r = await axios.get(`${API}/groups/${activeGroup.id}/members`); setGroupMembersList(r.data); }
+    catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
+  };
+
+  const handleRemoveMember = async (memberId) => {
+    try { await axios.delete(`${API}/groups/${activeGroup.id}/members/${memberId}`); const r = await axios.get(`${API}/groups/${activeGroup.id}/members`); setGroupMembersList(r.data); }
+    catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
+  };
+
+  const handleLeaveGroup = async () => {
+    try { await axios.delete(`${API}/groups/${activeGroup.id}/leave`); setGroups(prev=>prev.filter(g=>g.id!==activeGroup.id)); setActiveGroup(null); setActiveChannel('announcements'); setShowAdminPanel(false); loadMessages('channel','announcements'); }
+    catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
+  };
+
+  const handleMakeAdmin = async (memberId) => {
+    try { await axios.put(`${API}/groups/${activeGroup.id}/make-admin/${memberId}`); setActiveGroup(prev=>({...prev,admin_id:memberId})); setAdminError(''); loadGroups(); const r = await axios.get(`${API}/groups/${activeGroup.id}/members`); setGroupMembersList(r.data); }
+    catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
+  };
+
+  const isOnline = id => onlineUsers.some(u=>u.id===id);
+  const isBlocked = id => blockedUsers.some(u=>u.id===id);
+  const filteredMessages = searchQuery ? messages.filter(m=>m.text?.toLowerCase().includes(searchQuery.toLowerCase())) : messages;
+  // Filter users by username or ID
+  const filteredUsers = users.filter(u =>
+    u.username.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    formatUID(u.id).toLowerCase().includes(searchQuery.toLowerCase()) ||
+    String(u.id).includes(searchQuery)
+  );
+  const getChatTitle = () => activeDM ? activeDM.username : activeGroup ? activeGroup.name : `#${activeChannel}`;
+
+  const formatLastSeen = (ts) => {
+    if (!ts) return 'Never';
+    const diff = Math.floor((new Date() - new Date(ts)) / 1000);
+    if (diff < 60) return 'Just now';
+    if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+    return new Date(ts).toLocaleDateString();
+  };
+
+  const COLORS = ['#4A90E2','#10b981','#ef4444','#f59e0b','#ec4899','#06b6d4','#8b5cf6','#f97316'];
+
+  const renderMessage = (msg) => {
+    const isOwn = msg.user_id===user.id || msg.from_user_id===user.id;
+    const imageMatch = msg.text?.match(/\[IMAGE\](.*?)\[\/IMAGE\]/);
+    const isMissedCall = msg.deleted!==1 && msg.text && (msg.text.includes('Missed')||msg.text.includes('missed')) && (msg.text.includes('📞')||msg.text.includes('📹'));
+    const isDeleted = msg.deleted===1 || msg.text==='This message was deleted';
+    const msgReactions = reactions[msg.id] || {};
+    const isChannel = !!activeChannel;
+
+    return (
+      <motion.div key={msg.id}
+        initial={{ opacity:0, y:8, x:isOwn?20:-20 }}
+        animate={{ opacity:1, y:0, x:0 }}
+        transition={{ duration:0.25, ease:[0.34,1.56,0.64,1] }}
+        className={`flex gap-2 px-4 py-1 message-bubble ${isOwn?'flex-row-reverse':'flex-row'}`}
+        onContextMenu={e => !isDeleted && handleContextMenu(e, msg)}>
+
+        {!isOwn && (
+          <div className="flex-shrink-0 self-end">
+            <Avatar user={{ username:msg.username, avatar_color:msg.avatar_color, avatar_url:msg.avatar_url }} size={30} />
+          </div>
+        )}
+
+        <div className={`max-w-[65%] flex flex-col ${isOwn?'items-end':'items-start'}`}>
+          {isChannel && !isOwn && <span className="text-xs font-semibold mb-1 px-1" style={{ color:'rgba(150,180,255,0.7)' }}>{msg.username}</span>}
+
+          <div className={`relative px-3 py-2 rounded-2xl shadow-sm ${
+            isDeleted ? 'italic' :
+            isMissedCall ? 'border' : ''
+          }`} style={{
+            background: isDeleted ? 'rgba(255,255,255,0.04)' :
+              isMissedCall ? 'rgba(239,68,68,0.1)' :
+              isOwn ? 'linear-gradient(135deg, #4A90E2, #2563eb)' :
+              'rgba(255,255,255,0.07)',
+            border: isDeleted ? '1px solid rgba(255,255,255,0.08)' :
+              isMissedCall ? '1px solid rgba(239,68,68,0.3)' :
+              isOwn ? 'none' : '1px solid rgba(74,144,226,0.15)',
+            borderRadius: isOwn ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+            boxShadow: isOwn ? '0 4px 15px rgba(74,144,226,0.25)' : 'none',
+          }}>
+            {isDeleted ? (
+              <p className="text-xs italic" style={{ color:'rgba(150,180,255,0.4)' }}>🚫 This message was deleted</p>
+            ) : imageMatch ? (
+              <img src={imageMatch[1]} alt="shared"
+                className="max-w-xs rounded-xl cursor-pointer transition-all hover:scale-105 hover:shadow-lg"
+                style={{ boxShadow:'0 4px 20px rgba(74,144,226,0.2)' }}
+                onClick={e=>{e.stopPropagation();setImageViewer(imageMatch[1]);}}
+              />
+            ) : isMissedCall ? (
+              <div className="flex items-center gap-2"><PhoneMissed size={14} style={{ color:'#ef4444' }} /><span className="text-sm" style={{ color:'#ef4444' }}>{msg.text}</span></div>
+            ) : (
+              <p className="text-sm leading-relaxed break-words text-white">{msg.text}</p>
+            )}
+            {msg.edited===1 && !isDeleted && <span className="text-xs opacity-50 ml-1">(edited)</span>}
+          </div>
+
+          <div className={`flex items-center gap-1 mt-0.5 px-1 ${isOwn?'flex-row-reverse':'flex-row'}`}>
+            <span className="text-xs" style={{ color:'rgba(150,180,255,0.4)' }}>{new Date(msg.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
+            {isOwn && (msg.seen_at ? <CheckCheck size={12} style={{ color:'#4A90E2' }} /> : <CheckCheck size={12} style={{ color:'rgba(150,180,255,0.4)' }} />)}
+          </div>
+
+          {Object.keys(msgReactions).length > 0 && (
+            <div className="flex gap-1 mt-1 flex-wrap">
+              {Object.entries(msgReactions).map(([emoji, users]) => (
+                <span key={emoji} onClick={()=>handleReaction(msg.id,emoji)}
+                  className="text-xs rounded-full px-2 py-0.5 cursor-pointer transition-all hover:scale-110"
+                  style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.25)' }}>
+                  {emoji} {users.length}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {!isDeleted && (
+          <button onClick={()=>setReplyTo(msg)} className="self-center p-1 opacity-0 hover:opacity-100 transition-opacity rounded-lg"
+            style={{ color:'rgba(150,180,255,0.6)' }}>
+            <Reply size={14} />
+          </button>
+        )}
+      </motion.div>
+    );
+  };
+
+  // ── IMAGE VIEWER ──
+  const ImageViewer = ({ src, onClose }) => {
+    const [zoom, setZoom] = useState(1);
+    const [pos, setPos] = useState({ x:0, y:0 });
+    const [dragging, setDragging] = useState(false);
+    const [dragStart, setDragStart] = useState({ x:0, y:0 });
+    const imgRef = useRef();
+
+    const handleWheel = (e) => {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -0.15 : 0.15;
+      setZoom(z => Math.max(0.5, Math.min(5, z + delta)));
+    };
+
+    const handleMouseDown = (e) => {
+      setDragging(true);
+      setDragStart({ x: e.clientX - pos.x, y: e.clientY - pos.y });
+    };
+
+    const handleMouseMove = (e) => {
+      if (!dragging) return;
+      setPos({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+    };
+
+    useEffect(() => {
+      const el = imgRef.current;
+      if (el) el.addEventListener('wheel', handleWheel, { passive: false });
+      return () => { if (el) el.removeEventListener('wheel', handleWheel); };
+    }, []);
+
+    return (
+      <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} exit={{ opacity:0 }}
+        className="fixed inset-0 z-[9999] flex items-center justify-center"
+        style={{ background:'rgba(0,0,0,0.95)', backdropFilter:'blur(20px)' }}
+        onClick={onClose}>
+
+        {/* Controls */}
+        <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
+          <button onClick={e=>{e.stopPropagation();setZoom(z=>Math.min(5,z+0.25));}}
+            className="w-9 h-9 rounded-full flex items-center justify-center text-white font-bold text-lg transition-all hover:scale-110"
+            style={{ background:'rgba(74,144,226,0.3)', border:'1px solid rgba(74,144,226,0.5)' }}>+</button>
+          <span className="text-white text-sm font-mono px-2 py-1 rounded" style={{ background:'rgba(0,0,0,0.5)' }}>{Math.round(zoom*100)}%</span>
+          <button onClick={e=>{e.stopPropagation();setZoom(z=>Math.max(0.5,z-0.25));}}
+            className="w-9 h-9 rounded-full flex items-center justify-center text-white font-bold text-lg transition-all hover:scale-110"
+            style={{ background:'rgba(74,144,226,0.3)', border:'1px solid rgba(74,144,226,0.5)' }}>−</button>
+          <button onClick={e=>{e.stopPropagation();setZoom(1);setPos({x:0,y:0});}}
+            className="px-3 h-9 rounded-full text-white text-xs font-semibold transition-all hover:scale-110"
+            style={{ background:'rgba(74,144,226,0.3)', border:'1px solid rgba(74,144,226,0.5)' }}>Reset</button>
+          <button onClick={onClose}
+            className="w-9 h-9 rounded-full flex items-center justify-center text-white transition-all hover:scale-110"
+            style={{ background:'rgba(239,68,68,0.3)', border:'1px solid rgba(239,68,68,0.5)' }}>✕</button>
+        </div>
+
+        {/* Zoom hint */}
+        <p className="absolute bottom-4 left-1/2 -translate-x-1/2 text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>
+          🖱️ Scroll to zoom · Drag to pan · Click outside to close
+        </p>
+
+        {/* Image */}
+        <div ref={imgRef}
+          style={{ cursor: dragging ? 'grabbing' : 'grab', userSelect:'none' }}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={()=>setDragging(false)}
+          onMouseLeave={()=>setDragging(false)}
+          onClick={e=>e.stopPropagation()}>
+          <motion.img
+            src={src} alt="preview"
+            style={{ transform:`translate(${pos.x}px,${pos.y}px) scale(${zoom})`, transformOrigin:'center', maxWidth:'85vw', maxHeight:'85vh', borderRadius:12, objectFit:'contain', boxShadow:'0 20px 60px rgba(0,0,0,0.8)' }}
+            transition={{ type:'spring', damping:20 }}
+            draggable={false}
+          />
+        </div>
+      </motion.div>
+    );
+  };
+
+  // ── MODAL STYLES ──
+  const modalOverlay = { position:'fixed',inset:0,zIndex:50,background:'rgba(0,5,20,0.8)',backdropFilter:'blur(10px)',display:'flex',alignItems:'center',justifyContent:'center',padding:20 };
+  const modalCard = { borderRadius:20,padding:32,background:'rgba(3,8,28,0.95)',border:'1px solid rgba(74,144,226,0.25)',boxShadow:'0 0 100px rgba(20,50,200,0.2),0 40px 80px rgba(0,0,0,0.8)',width:'100%',maxWidth:400 };
+  const inputSt = { width:'100%',padding:'12px 14px',borderRadius:10,fontSize:14,background:'rgba(255,255,255,0.06)',border:'1px solid rgba(74,144,226,0.25)',color:'white',outline:'none',boxSizing:'border-box',fontFamily:'inherit',transition:'all 0.2s' };
+  const btnPrimary = { width:'100%',padding:'13px 0',borderRadius:10,fontWeight:700,fontSize:14,background:'linear-gradient(135deg,#4A90E2,#2563eb)',border:'none',color:'white',cursor:'pointer',fontFamily:'inherit',boxShadow:'0 4px 20px rgba(74,144,226,0.4)',transition:'all 0.2s' };
+
+  return (
+    <div className="flex h-screen overflow-hidden chat-bg" style={{ fontFamily:"'Segoe UI',sans-serif" }}
+      onClick={() => { setContextMenu(null); setShowEmoji(false); }}>
+
+      {/* Stars background */}
+      <StarsBackground />
+
+      {/* ── SIDEBAR ── */}
+      <motion.div initial={{ x:-20, opacity:0 }} animate={{ x:0, opacity:1 }} transition={{ duration:0.5 }}
+        className="sidebar flex flex-col flex-shrink-0 z-10" style={{ width:240 }}>
+
+        {/* Logo */}
+        <div className="p-4 flex items-center justify-between" style={{ borderBottom:'1px solid rgba(74,144,226,0.15)' }}>
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background:'linear-gradient(135deg,#4A90E2,#2563eb)', boxShadow:'0 0 12px rgba(74,144,226,0.4)' }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                <circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+              </svg>
+            </div>
+            <span className="font-bold text-sm text-white">ChatSpace Pro</span>
+          </div>
+          <div className="flex gap-1">
+            <button onClick={() => setNotifEnabled(!notifEnabled)} className="p-1.5 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.6)' }} title={notifEnabled?'Mute':'Unmute'}>
+              {notifEnabled ? <Bell size={13}/> : <BellOff size={13}/>}
+            </button>
+            <button onClick={toggle} className="p-1.5 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.6)' }}>
+              {dark ? <Sun size={13}/> : <Moon size={13}/>}
+            </button>
+          </div>
+        </div>
+
+        {/* Channels */}
+        <div className="px-2 pt-3">
+          <p className="text-xs font-bold px-2 mb-1 uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Channels</p>
+          {CHANNELS.map(ch => {
+            const labels = { 'announcements': '📢 Announcements', 'tech-updates': '💻 Tech Updates', 'job-notifications': '💼 Job Notifications' };
+            return (
+              <button key={ch} onClick={()=>switchChannel(ch)}
+                className={`sidebar-item w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm mb-0.5 ${activeChannel===ch?'active':''}`}
+                style={{ color: activeChannel===ch ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeChannel===ch ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
+                <span className="truncate">{labels[ch] || ch}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Groups */}
+        <div className="px-2 pt-3">
+          <div className="flex items-center justify-between px-2 mb-1">
+            <p className="text-xs font-bold uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Groups</p>
+            <button onClick={()=>setShowCreateGroup(true)} className="transition-all hover:scale-125" style={{ color:'rgba(150,180,255,0.5)' }}><Plus size={13}/></button>
+          </div>
+          {groups.map(g => (
+            <button key={g.id} onClick={()=>switchGroup(g)}
+              className={`sidebar-item w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm mb-0.5 ${activeGroup?.id===g.id?'active':''}`}
+              style={{ color: activeGroup?.id===g.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeGroup?.id===g.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
+              <Users size={14}/><span className="truncate">{g.name}</span>
+              {g.admin_id===user.id && <span className="ml-auto text-xs" style={{ color:'#f59e0b' }}>★</span>}
+            </button>
+          ))}
+        </div>
+
+        {/* DMs */}
+        <div className="px-2 pt-3 flex-1 overflow-y-auto">
+          <p className="text-xs font-bold px-2 mb-1 uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Direct Messages</p>
+          {(searchQuery ? filteredUsers : users).map(u => (
+            <button key={u.id} onClick={()=>switchDM(u)}
+              className={`sidebar-item w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm mb-0.5 ${activeDM?.id===u.id?'active':''}`}
+              style={{ color: activeDM?.id===u.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeDM?.id===u.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
+              <Avatar user={u} size={24} showStatus />
+              <div className="flex-1 min-w-0">
+                <span className="truncate block">{u.username}</span>
+                <span className="text-xs" style={{ color:'rgba(100,140,255,0.5)' }}>{formatUID(u.id)}</span>
+              </div>
+              {isOnline(u.id) && <div className="w-1.5 h-1.5 rounded-full flex-shrink-0 online-dot" style={{ background: STATUS_CONFIG[u.status||'online']?.hex || '#22c55e' }} />}
+            </button>
+          ))}
+        </div>
+
+        {/* Admin Panel Button - only for admin */}
+        {/* Admin Panel - show for admin role */}
+        <div className="px-2 pb-2">
+          <button
+            onClick={() => { console.log('Admin panel clicked, role:', user.role, 'user:', user); setShowAdminUsers(true); loadAdminUsers(); }}
+            style={{ width:'100%', display:'flex', alignItems:'center', gap:8, padding:'8px 12px', borderRadius:10, fontSize:13, fontWeight:700, background: user.role==='admin' ? 'rgba(245,158,11,0.15)' : 'rgba(74,144,226,0.1)', border: user.role==='admin' ? '1px solid rgba(245,158,11,0.3)' : '1px solid rgba(74,144,226,0.2)', color: user.role==='admin' ? '#f59e0b' : 'rgba(74,144,226,0.5)', cursor:'pointer', fontFamily:'inherit' }}>
+            {user.role==='admin' ? '👑' : '🔒'} {user.role==='admin' ? 'Admin Panel' : `Role: ${user.role}`}
+          </button>
+        </div>
+
+        {/* User footer */}
+        <div className="p-3 flex items-center gap-2" style={{ borderTop:'1px solid rgba(74,144,226,0.15)' }}>
+          <button onClick={openAccount} className="flex-shrink-0 hover:scale-105 transition-transform">
+            <Avatar user={user} size={32} showStatus />
+          </button>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-white truncate">{user.username}</p>
+            <p className="text-xs" style={{ color:'rgba(100,140,255,0.6)' }}>{formatUID(user.id)} · <span style={{ color: STATUS_CONFIG[user.status||'online']?.hex }}>● {STATUS_CONFIG[user.status||'online']?.label}</span></p>
+          </div>
+          <button onClick={logout} className="p-1.5 rounded-lg transition-all hover:scale-110" style={{ color:'#ef4444', background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.2)' }} title="Logout">
+            <LogOut size={13}/>
+          </button>
+        </div>
+      </motion.div>
+
+      {/* ── MAIN CHAT ── */}
+      <div className="flex-1 flex flex-col overflow-hidden z-10">
+
+        {/* Header */}
+        <div className="chat-header h-14 flex items-center px-4 gap-3 flex-shrink-0">
+          {activeDM ? <Avatar user={activeDM} size={32} showStatus /> : (
+            <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.25)' }}>
+              {activeGroup ? <Users size={15} style={{ color:'#4A90E2' }}/> : <Hash size={15} style={{ color:'#4A90E2' }}/>}
+            </div>
+          )}
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="font-bold text-sm text-white">{getChatTitle()}</h2>
+              {activeDM && <span className="text-xs px-1.5 py-0.5 rounded-md font-mono" style={{ background:'rgba(74,144,226,0.15)', color:'rgba(100,160,255,0.8)', border:'1px solid rgba(74,144,226,0.2)' }}>{formatUID(activeDM.id)}</span>}
+            </div>
+            {activeDM && <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>{isOnline(activeDM.id) ? `● ${STATUS_CONFIG[activeDM.status||'online']?.label}` : `Last seen ${formatLastSeen(activeDM.last_seen)}`}</p>}
+            {activeGroup && <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>{groupMembersList.length} members{pinnedMessages.length>0?` · 📌 ${pinnedMessages.length} pinned`:''}</p>}
+          </div>
+          <div className="ml-auto flex items-center gap-1">
+            {activeDM && (
+              <>
+                <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={()=>startCall('voice')} disabled={callLoading}
+                  className="call-btn p-2 rounded-lg" style={{ background:'rgba(34,197,94,0.15)', border:'1px solid rgba(34,197,94,0.25)', color:'#22c55e' }}>
+                  <Phone size={15}/>
+                </motion.button>
+                <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={()=>startCall('video')} disabled={callLoading}
+                  className="call-btn p-2 rounded-lg" style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.25)', color:'#4A90E2' }}>
+                  <Video size={15}/>
+                </motion.button>
+              </>
+            )}
+            {activeGroup && (
+              <motion.button whileHover={{ scale:1.1 }} whileTap={{ scale:0.9 }} onClick={()=>startCall('video')} disabled={callLoading}
+                className="call-btn p-2 rounded-lg" style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.25)', color:'#4A90E2' }} title="Group Video Call">
+                <Video size={15}/>
+              </motion.button>
+            )}
+            <button onClick={()=>setShowSearch(!showSearch)} className="p-2 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.6)' }}><Search size={15}/></button>
+            {activeGroup && <button onClick={()=>setShowAdminPanel(true)} className="p-2 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.6)' }}><Users size={15}/></button>}
+            <button onClick={()=>setShowInfo(!showInfo)} className="p-2 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.6)' }}><Info size={15}/></button>
+          </div>
+        </div>
+
+        {/* Pinned messages bar */}
+        {activeGroup && pinnedMessages.length>0 && (
+          <div className="pinned-bar px-4 py-1.5 flex items-center gap-2">
+            <Pin size={11} style={{ color:'#4A90E2' }}/>
+            <p className="text-xs truncate" style={{ color:'rgba(150,180,255,0.7)' }}>📌 {pinnedMessages[pinnedMessages.length-1]?.text}</p>
+          </div>
+        )}
+
+        {/* Search bar */}
+        <AnimatePresence>
+          {showSearch && (
+            <motion.div initial={{ height:0, opacity:0 }} animate={{ height:'auto', opacity:1 }} exit={{ height:0, opacity:0 }}
+              className="px-4 py-2" style={{ borderBottom:'1px solid rgba(74,144,226,0.15)', background:'rgba(3,8,25,0.6)' }}>
+              <div className="relative">
+                <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color:'rgba(150,180,255,0.5)' }}/>
+                <input value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="Search messages..."
+                  className="w-full text-sm text-white outline-none"
+                  style={{ ...inputSt, paddingLeft:32, paddingRight:32, padding:'8px 32px' }}
+                  onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.6)';e.target.style.boxShadow='0 0 0 3px rgba(74,144,226,0.12)';}}
+                  onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';e.target.style.boxShadow='none';}}
+                />
+                {searchQuery && <button onClick={()=>setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2" style={{ color:'rgba(150,180,255,0.5)' }}><X size={13}/></button>}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Messages */}
+        <div className="flex-1 overflow-y-auto py-4 space-y-1"
+          style={{ background: dark ? 'transparent' : 'rgba(240,244,255,0.5)' }}>
+          <AnimatePresence>{filteredMessages.map(renderMessage)}</AnimatePresence>
+          {typingUsers.map(u => <TypingIndicator key={u} username={u}/>)}
+          <div ref={messagesEndRef}/>
+        </div>
+
+        {/* Reply preview */}
+        <AnimatePresence>
+          {replyTo && (
+            <motion.div initial={{ height:0, opacity:0 }} animate={{ height:'auto', opacity:1 }} exit={{ height:0, opacity:0 }}
+              className="mx-4 mb-2 px-3 py-2 flex items-center gap-3 rounded-xl"
+              style={{ background:'rgba(74,144,226,0.1)', border:'1px solid rgba(74,144,226,0.25)' }}>
+              <Reply size={13} style={{ color:'#4A90E2' }}/>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-semibold" style={{ color:'#4A90E2' }}>{replyTo.username}</p>
+                <p className="text-xs truncate" style={{ color:'rgba(150,180,255,0.5)' }}>{replyTo.text}</p>
+              </div>
+              <button onClick={()=>setReplyTo(null)} style={{ color:'rgba(150,180,255,0.5)' }}><X size={13}/></button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Edit bar */}
+        <AnimatePresence>
+          {editingMsg && (
+            <motion.div initial={{ height:0, opacity:0 }} animate={{ height:'auto', opacity:1 }} exit={{ height:0, opacity:0 }}
+              className="mx-4 mb-2 px-3 py-2 flex items-center gap-3 rounded-xl"
+              style={{ background:'rgba(245,158,11,0.1)', border:'1px solid rgba(245,158,11,0.25)' }}>
+              <Edit2 size={13} style={{ color:'#f59e0b' }}/>
+              <input value={editText} onChange={e=>setEditText(e.target.value)}
+                onKeyDown={e=>{ if(e.key==='Enter') handleEditMessage(); if(e.key==='Escape'){setEditingMsg(null);setEditText('');} }}
+                className="flex-1 bg-transparent text-sm text-white focus:outline-none" placeholder="Edit message..."/>
+              <button onClick={handleEditMessage} style={{ color:'#f59e0b' }}><Check size={13}/></button>
+              <button onClick={()=>{setEditingMsg(null);setEditText('');}} style={{ color:'rgba(150,180,255,0.5)' }}><X size={13}/></button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Input */}
+        <div className="chat-input-area flex-shrink-0">
+          {activeChannel && !canPost ? (
+            <div className="p-4 flex items-center justify-center gap-3">
+              <span style={{ fontSize:22 }}>🔒</span>
+              <div>
+                <p className="text-sm font-semibold text-white">Read Only</p>
+                <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>
+                  {activeChannel === 'announcements' ? 'Only admin can post in Announcements' : 'You need permission to post here'}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="p-3">
+              <div className="chat-input-box relative flex items-end gap-2 p-2 rounded-2xl">
+                <button onClick={()=>fileInputRef.current?.click()} className="p-2 rounded-xl transition-all hover:scale-110 flex-shrink-0" style={{ color:'rgba(150,180,255,0.6)' }}>
+                  <Paperclip size={17}/>
+                </button>
+                <input ref={fileInputRef} type="file" accept="image/*" style={{ display:'none' }} onChange={handleImageUpload}/>
+                <textarea value={input} onChange={handleTyping}
+                  onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();} }}
+                  placeholder={`Message ${getChatTitle()}...`} rows={1}
+                  className="flex-1 bg-transparent text-sm text-white focus:outline-none resize-none py-1.5 max-h-32"
+                  style={{ fontFamily:'inherit' }}/>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  <button onClick={e=>{e.stopPropagation();setShowEmoji(!showEmoji);}} className="p-2 rounded-xl transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.6)' }}>
+                    <Smile size={17}/>
+                  </button>
+                  <motion.button onClick={sendMessage} whileHover={{ scale:1.08 }} whileTap={{ scale:0.92 }}
+                    disabled={!input.trim()} className="send-btn p-2 rounded-xl text-white disabled:opacity-40">
+                    <Send size={15}/>
+                  </motion.button>
+                </div>
+                <AnimatePresence>
+                  {showEmoji && (
+                    <motion.div initial={{ opacity:0, scale:0.9, y:10 }} animate={{ opacity:1, scale:1, y:0 }}
+                      exit={{ opacity:0, scale:0.9, y:10 }} onClick={e=>e.stopPropagation()}
+                      className="absolute bottom-full right-0 mb-2 z-50">
+                      <EmojiPicker onEmojiClick={e=>setInput(prev=>prev+e.emoji)} theme="dark" height={350} width={300}/>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── INFO PANEL ── */}
+      <AnimatePresence>
+        {showInfo && (
+          <motion.div initial={{ width:0, opacity:0 }} animate={{ width:260, opacity:1 }} exit={{ width:0, opacity:0 }}
+            className="z-10 flex-shrink-0 overflow-hidden" style={{ background:'rgba(3,8,25,0.9)', borderLeft:'1px solid rgba(74,144,226,0.15)', backdropFilter:'blur(20px)' }}>
+            <div className="p-4 flex items-center justify-between" style={{ borderBottom:'1px solid rgba(74,144,226,0.15)' }}>
+              <h3 className="font-bold text-sm text-white">{activeGroup?'Group Info':activeDM?'Profile':'Channel Info'}</h3>
+              <button onClick={()=>setShowInfo(false)} style={{ color:'rgba(150,180,255,0.5)' }}><X size={15}/></button>
+            </div>
+            <div className="p-4 flex flex-col items-center gap-3">
+              {activeDM ? (
+                <>
+                  <Avatar user={activeDM} size={64} showStatus />
+                  <div className="text-center">
+                    <p className="font-bold text-white">{activeDM.username}</p>
+                    <p className="text-xs font-mono mt-1 px-2 py-0.5 rounded-md inline-block" style={{ background:'rgba(74,144,226,0.15)', color:'rgba(100,160,255,0.8)', border:'1px solid rgba(74,144,226,0.2)' }}>ID: {formatUID(activeDM.id)}</p>
+                    <p className="text-xs mt-1" style={{ color: STATUS_CONFIG[activeDM.status||'online']?.hex }}>{isOnline(activeDM.id) ? `● ${STATUS_CONFIG[activeDM.status||'online']?.label}` : `Last seen ${formatLastSeen(activeDM.last_seen)}`}</p>
+                    {activeDM.bio && <p className="text-xs mt-2 italic" style={{ color:'rgba(150,180,255,0.6)' }}>"{activeDM.bio}"</p>}
+                  </div>
+                  <div className="flex gap-2 w-full mt-2">
+                    <button onClick={()=>startCall('voice')} className="flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-sm transition-all hover:scale-105" style={{ background:'rgba(34,197,94,0.15)', border:'1px solid rgba(34,197,94,0.3)', color:'#22c55e' }}>
+                      <Phone size={13}/> Call
+                    </button>
+                    <button onClick={()=>startCall('video')} className="flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-sm transition-all hover:scale-105" style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.3)', color:'#4A90E2' }}>
+                      <Video size={13}/> Video
+                    </button>
+                  </div>
+                  <button onClick={()=>isBlocked(activeDM.id)?handleUnblock(activeDM.id):handleBlock(activeDM.id)}
+                    className="w-full flex items-center justify-center gap-2 py-2 rounded-xl text-sm transition-all hover:scale-105"
+                    style={{ background: isBlocked(activeDM.id)?'rgba(34,197,94,0.1)':'rgba(239,68,68,0.1)', border:`1px solid ${isBlocked(activeDM.id)?'rgba(34,197,94,0.3)':'rgba(239,68,68,0.3)'}`, color: isBlocked(activeDM.id)?'#22c55e':'#ef4444' }}>
+                    {isBlocked(activeDM.id)?<><UserCheck size={13}/> Unblock</>:<><UserX size={13}/> Block User</>}
+                  </button>
+                </>
+              ) : activeGroup ? (
+                <>
+                  <div className="w-14 h-14 rounded-full flex items-center justify-center" style={{ background:'rgba(74,144,226,0.2)', border:'1px solid rgba(74,144,226,0.35)' }}>
+                    <Users size={24} style={{ color:'#4A90E2' }}/>
+                  </div>
+                  <div className="text-center">
+                    <p className="font-bold text-white">{activeGroup.name}</p>
+                    <p className="text-xs mt-1" style={{ color:'rgba(150,180,255,0.5)' }}>{groupMembersList.length} members</p>
+                  </div>
+                  {pinnedMessages.length>0 && (
+                    <div className="w-full">
+                      <p className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color:'rgba(150,180,255,0.5)' }}>📌 Pinned</p>
+                      {pinnedMessages.map(m=>(
+                        <div key={m.id} className="text-xs truncate px-2 py-1 mb-1 rounded-lg" style={{ background:'rgba(74,144,226,0.1)', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.7)' }}>{m.text}</div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="w-full">
+                    <p className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color:'rgba(150,180,255,0.5)' }}>Members</p>
+                    {groupMembersList.map(m=>(
+                      <div key={m.id} className="flex items-center gap-2 py-1.5">
+                        <Avatar user={m} size={26} showStatus />
+                        <span className="text-sm text-white">{m.username}</span>
+                        {m.id===activeGroup.admin_id && <span className="ml-auto text-xs px-1.5 py-0.5 rounded" style={{ background:'rgba(245,158,11,0.15)', color:'#f59e0b' }}>admin</span>}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="text-center">
+                  <div className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-3" style={{ background:'rgba(74,144,226,0.2)', border:'1px solid rgba(74,144,226,0.35)' }}>
+                    <Hash size={24} style={{ color:'#4A90E2' }}/>
+                  </div>
+                  <p className="font-bold text-white">#{activeChannel}</p>
+                  <p className="text-xs mt-1" style={{ color:'rgba(150,180,255,0.5)' }}>{onlineUsers.length} online</p>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── CONTEXT MENU ── */}
+      <AnimatePresence>
+        {contextMenu && (
+          <motion.div initial={{ opacity:0, scale:0.9 }} animate={{ opacity:1, scale:1 }} exit={{ opacity:0, scale:0.9 }}
+            onClick={e=>e.stopPropagation()} className="context-menu fixed z-50 rounded-xl p-2 min-w-[170px]"
+            style={{ left:contextMenu.x, top:contextMenu.y }}>
+            <div className="flex gap-1 mb-2 px-2">
+              {['👍','❤️','😂','😮','😢','🔥'].map(emoji=>(
+                <button key={emoji} onClick={()=>handleReaction(contextMenu.msg.id,emoji)} className="text-lg hover:scale-125 transition-transform">{emoji}</button>
+              ))}
+            </div>
+            <div className="pt-1" style={{ borderTop:'1px solid rgba(74,144,226,0.15)' }}>
+              {[
+                { icon:<Reply size={13}/>, label:'Reply', action:()=>{setReplyTo(contextMenu.msg);setContextMenu(null);} },
+                { icon:<Forward size={13}/>, label:'Forward', action:()=>{setForwardMsg(contextMenu.msg);setContextMenu(null);} },
+                ...(contextMenu.msg.user_id===user.id||contextMenu.msg.from_user_id===user.id ? [
+                  ...(!contextMenu.msg.text?.includes('[IMAGE]') ? [{ icon:<Edit2 size={13}/>, label:'Edit', action:()=>{setEditingMsg({...contextMenu.msg,type:activeDM?'private':activeGroup?'group':'channel'});setEditText(contextMenu.msg.text);setContextMenu(null);} }] : []),
+                  { icon:<Trash2 size={13}/>, label:'Delete', action:()=>handleDeleteMessage(contextMenu.msg), red:true },
+                ] : []),
+                ...(activeGroup&&activeGroup.admin_id===user.id ? [{ icon:<Pin size={13}/>, label:'Pin', action:()=>handlePinMessage(contextMenu.msg), yellow:true }] : []),
+              ].map((item,i)=>(
+                <button key={i} onClick={item.action}
+                  className="w-full text-left px-3 py-1.5 text-sm flex items-center gap-2 rounded-lg transition-colors hover:bg-white/5"
+                  style={{ color: item.red ? '#ef4444' : item.yellow ? '#f59e0b' : 'rgba(200,220,255,0.8)' }}>
+                  {item.icon} {item.label}
+                </button>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── CREATE GROUP ── */}
+      {showCreateGroup && (
+        <div style={modalOverlay} onClick={()=>setShowCreateGroup(false)}>
+          <motion.div initial={{ scale:0.9, y:20 }} animate={{ scale:1, y:0 }} onClick={e=>e.stopPropagation()} style={{ ...modalCard, maxWidth:440 }}>
+            <h2 className="text-lg font-bold text-white mb-5 flex items-center gap-2"><Users size={19} style={{ color:'#4A90E2' }}/> Create Group</h2>
+            <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+
+              {/* Group name */}
+              <input value={groupName} onChange={e=>setGroupName(e.target.value)} placeholder="Group name" style={inputSt}
+                onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';e.target.style.boxShadow='0 0 0 3px rgba(74,144,226,0.12)';}}
+                onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';e.target.style.boxShadow='none';}}/>
+
+              {/* Member search */}
+              <div>
+                <p style={{ fontSize:11,color:'rgba(150,180,255,0.6)',marginBottom:8,textTransform:'uppercase',letterSpacing:1,fontWeight:700 }}>Add Members</p>
+                <div style={{ position:'relative',marginBottom:8 }}>
+                  <input
+                    value={groupMemberSearch}
+                    onChange={e=>setGroupMemberSearch(e.target.value)}
+                    placeholder="Search by username or User ID..."
+                    style={{ ...inputSt, paddingLeft:36 }}
+                    onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';e.target.style.boxShadow='0 0 0 3px rgba(74,144,226,0.12)';}}
+                    onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';e.target.style.boxShadow='none';}}
+                  />
+                  <span style={{ position:'absolute',left:12,top:'50%',transform:'translateY(-50%)',fontSize:14,pointerEvents:'none' }}>🔍</span>
+                </div>
+
+                {/* Search results */}
+                {groupMemberSearch && (
+                  <div style={{ maxHeight:160,overflowY:'auto',borderRadius:10,border:'1px solid rgba(74,144,226,0.2)',background:'rgba(3,8,28,0.95)',marginBottom:8 }}>
+                    {users.filter(u =>
+                      u.username.toLowerCase().includes(groupMemberSearch.toLowerCase()) ||
+                      (u.user_code && u.user_code.toLowerCase().includes(groupMemberSearch.toLowerCase())) ||
+                      String(u.id).includes(groupMemberSearch)
+                    ).map(u => {
+                      const already = selectedGroupMembers.find(m => m.id === u.id);
+                      return (
+                        <div key={u.id}
+                          onClick={() => {
+                            if (!already) setSelectedGroupMembers(prev => [...prev, u]);
+                            setGroupMemberSearch('');
+                          }}
+                          style={{ display:'flex',alignItems:'center',gap:10,padding:'10px 14px',cursor:'pointer',borderBottom:'1px solid rgba(74,144,226,0.1)',transition:'background 0.15s' }}
+                          onMouseEnter={e=>e.currentTarget.style.background='rgba(74,144,226,0.1)'}
+                          onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                          <Avatar user={u} size={28} />
+                          <div>
+                            <p style={{ fontSize:13,fontWeight:600,color:'white',margin:0 }}>{u.username}</p>
+                            <p style={{ fontSize:11,fontFamily:'monospace',color:'rgba(100,140,255,0.6)',margin:0 }}>{u.user_code || `CSP-${user.companyCode}-${String(u.id).padStart(6,'0')}`}</p>
+                          </div>
+                          {already && <span style={{ marginLeft:'auto',color:'#22c55e',fontSize:12 }}>✓ Added</span>}
+                        </div>
+                      );
+                    })}
+                    {users.filter(u =>
+                      u.username.toLowerCase().includes(groupMemberSearch.toLowerCase()) ||
+                      (u.user_code && u.user_code.toLowerCase().includes(groupMemberSearch.toLowerCase()))
+                    ).length === 0 && (
+                      <p style={{ textAlign:'center',color:'rgba(150,180,255,0.4)',fontSize:13,padding:16 }}>No users found</p>
+                    )}
+                  </div>
+                )}
+
+                {/* Selected members */}
+                {selectedGroupMembers.length > 0 && (
+                  <div style={{ display:'flex',flexWrap:'wrap',gap:6 }}>
+                    {selectedGroupMembers.map(m => (
+                      <div key={m.id} style={{ display:'flex',alignItems:'center',gap:6,padding:'4px 10px',borderRadius:20,background:'rgba(74,144,226,0.15)',border:'1px solid rgba(74,144,226,0.3)' }}>
+                        <span style={{ fontSize:12,color:'white',fontWeight:600 }}>{m.username}</span>
+                        <button onClick={()=>setSelectedGroupMembers(prev=>prev.filter(x=>x.id!==m.id))}
+                          style={{ background:'none',border:'none',color:'rgba(150,180,255,0.6)',cursor:'pointer',padding:0,fontSize:14,lineHeight:1 }}>✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {selectedGroupMembers.length === 0 && !groupMemberSearch && (
+                  <p style={{ fontSize:12,color:'rgba(150,180,255,0.4)',textAlign:'center' }}>Search and select members above</p>
+                )}
+              </div>
+
+              {groupError && <p style={{ color:'#f87171', fontSize:12, margin:0 }}>{groupError}</p>}
+
+              <div style={{ display:'flex',gap:12,paddingTop:4 }}>
+                <button onClick={handleCreateGroup} style={btnPrimary}>
+                  Create Group {selectedGroupMembers.length > 0 && `(${selectedGroupMembers.length} members)`}
+                </button>
+                <button onClick={()=>{setShowCreateGroup(false);setSelectedGroupMembers([]);setGroupMemberSearch('');}}
+                  style={{ ...btnPrimary, background:'rgba(255,255,255,0.06)', boxShadow:'none', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.7)' }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* ── GROUP ADMIN PANEL ── */}
+      {showAdminPanel && activeGroup && (
+        <div style={modalOverlay} onClick={()=>setShowAdminPanel(false)}>
+          <motion.div initial={{ scale:0.9, y:20 }} animate={{ scale:1, y:0 }} onClick={e=>e.stopPropagation()} style={{ ...modalCard, maxHeight:'80vh', overflowY:'auto' }}>
+            <h2 className="text-lg font-bold text-white mb-5 flex items-center gap-2"><Users size={19} style={{ color:'#4A90E2' }}/> {activeGroup.name}</h2>
+            {activeGroup.admin_id===user.id && (
+              <div className="mb-4">
+                <p className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color:'rgba(150,180,255,0.5)' }}>Add Member</p>
+                <div className="flex gap-2">
+                  <input value={addMemberInput} onChange={e=>setAddMemberInput(e.target.value)} placeholder="Username..." style={{ ...inputSt, flex:1 }}
+                    onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';}} onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';}}/>
+                  <button onClick={handleAddMember} style={{ padding:'0 16px', borderRadius:10, background:'rgba(34,197,94,0.2)', border:'1px solid rgba(34,197,94,0.3)', color:'#22c55e', fontWeight:700, cursor:'pointer', fontFamily:'inherit' }}>Add</button>
+                </div>
+              </div>
+            )}
+            {adminError && <p style={{ color:'#f87171', fontSize:12, marginBottom:8 }}>{adminError}</p>}
+            <p className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color:'rgba(150,180,255,0.5)' }}>Members</p>
+            <div className="space-y-2 mb-4">
+              {groupMembersList.map(m=>(
+                <div key={m.id} className="flex items-center gap-3 p-3 rounded-xl" style={{ background:'rgba(255,255,255,0.04)', border:'1px solid rgba(74,144,226,0.15)' }}>
+                  <Avatar user={m} size={32} showStatus />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-white">{m.username}</p>
+                    <p className="text-xs font-mono" style={{ color:'rgba(100,140,255,0.55)' }}>{formatUID(m.id)}{m.id===activeGroup.admin_id?' · ★ Admin':''}</p>
+                  </div>
+                  {activeGroup.admin_id===user.id && m.id!==user.id && m.id!==activeGroup.admin_id && (
+                    <div className="flex gap-1">
+                      <button onClick={()=>handleMakeAdmin(m.id)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg transition-all hover:scale-105" style={{ background:'rgba(245,158,11,0.15)', border:'1px solid rgba(245,158,11,0.3)', color:'#f59e0b' }}>
+                        <Shield size={10}/> Admin
+                      </button>
+                      <button onClick={()=>handleRemoveMember(m.id)} className="text-xs px-2 py-1 rounded-lg transition-all hover:scale-105" style={{ background:'rgba(239,68,68,0.15)', border:'1px solid rgba(239,68,68,0.3)', color:'#ef4444' }}>Remove</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            {activeGroup.admin_id!==user.id && (
+              <button onClick={handleLeaveGroup} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102" style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}>
+                <LogOut size={14}/> Leave Group
+              </button>
+            )}
+            <button onClick={()=>{setShowAdminPanel(false);setAdminError('');}} className="w-full py-2.5 rounded-xl text-sm transition-all" style={{ background:'rgba(255,255,255,0.05)', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.6)' }}>Close</button>
+          </motion.div>
+        </div>
+      )}
+
+      {/* ── FORWARD MODAL ── */}
+      {forwardMsg && (
+        <div style={modalOverlay} onClick={()=>setForwardMsg(null)}>
+          <motion.div initial={{ scale:0.9, y:20 }} animate={{ scale:1, y:0 }} onClick={e=>e.stopPropagation()} style={modalCard}>
+            <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2"><Forward size={19} style={{ color:'#4A90E2' }}/> Forward to...</h2>
+            <div className="space-y-2 max-h-60 overflow-y-auto">
+              {users.map(u=>(
+                <button key={u.id} onClick={()=>handleForward(u.id)} className="w-full flex items-center gap-3 p-3 rounded-xl transition-all hover:scale-102"
+                  style={{ background:'rgba(255,255,255,0.04)', border:'1px solid rgba(74,144,226,0.15)' }}>
+                  <Avatar user={u} size={32} showStatus />
+                  <span className="text-sm font-semibold text-white">{u.username}</span>
+                </button>
+              ))}
+            </div>
+            <button onClick={()=>setForwardMsg(null)} className="w-full mt-4 py-2.5 rounded-xl text-sm" style={{ background:'rgba(255,255,255,0.05)', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.6)' }}>Cancel</button>
+          </motion.div>
+        </div>
+      )}
+
+      {/* ── ACCOUNT MODAL ── */}
+      {showAccount && (
+        <div style={modalOverlay} onClick={()=>setShowAccount(false)}>
+          <motion.div initial={{ scale:0.9, y:20 }} animate={{ scale:1, y:0 }} onClick={e=>e.stopPropagation()} style={{ ...modalCard, overflowY:'auto', maxHeight:'90vh' }}>
+            <div className="flex items-center justify-between mb-5">
+              <h2 className="text-lg font-bold text-white flex items-center gap-2"><User size={19} style={{ color:'#4A90E2' }}/> My Account</h2>
+              <span className="text-xs font-mono px-2 py-1 rounded-lg" style={{ background:'rgba(74,144,226,0.15)', color:'rgba(100,160,255,0.9)', border:'1px solid rgba(74,144,226,0.25)' }}>ID: {formatUID(user.id)}</span>
+            </div>
+            <div className="flex flex-col items-center gap-3 mb-5">
+              <div className="relative cursor-pointer group" onClick={()=>avatarInputRef.current?.click()}>
+                <Avatar user={{ ...user, avatar_color:accountForm.avatar_color }} size={80} />
+                <div className="absolute inset-0 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity" style={{ background:'rgba(0,0,0,0.5)' }}>
+                  <span className="text-white text-xs font-semibold">Change</span>
+                </div>
+              </div>
+              <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={async e=>{await updateAvatar(e.target.files[0]);}}/>
+              <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>Click to change avatar photo</p>
+            </div>
+            <div className="space-y-4">
+              <div>
+                <label className="text-xs font-bold uppercase tracking-wider block mb-1.5" style={{ color:'rgba(150,180,255,0.6)' }}>Username</label>
+                <input value={accountForm.username} onChange={e=>setAccountForm(p=>({...p,username:e.target.value}))} style={inputSt}
+                  onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';}} onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';}}/>
+              </div>
+              <div>
+                <label className="text-xs font-bold uppercase tracking-wider block mb-1.5" style={{ color:'rgba(150,180,255,0.6)' }}>Bio</label>
+                <textarea value={accountForm.bio} onChange={e=>setAccountForm(p=>({...p,bio:e.target.value}))} maxLength={200} rows={3}
+                  placeholder="Tell people about yourself..." style={{ ...inputSt, resize:'none' }}
+                  onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';}} onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';}}/>
+                <p className="text-right text-xs mt-1" style={{ color:'rgba(150,180,255,0.4)' }}>{accountForm.bio.length}/200</p>
+              </div>
+              <div>
+                <label className="text-xs font-bold uppercase tracking-wider block mb-2" style={{ color:'rgba(150,180,255,0.6)' }}>Status</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {Object.entries(STATUS_CONFIG).map(([key,val])=>(
+                    <button key={key} onClick={()=>setAccountForm(p=>({...p,status:key}))}
+                      className="flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-all hover:scale-105"
+                      style={{ border: accountForm.status===key?`1.5px solid ${val.hex}`:'1px solid rgba(74,144,226,0.2)', background: accountForm.status===key?`${val.hex}22`:'rgba(255,255,255,0.04)', color:'white' }}>
+                      <div className="w-2.5 h-2.5 rounded-full" style={{ background:val.hex, boxShadow:`0 0 6px ${val.hex}` }}/>
+                      {val.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {accountError && <p style={{ color:'#f87171', fontSize:12 }}>{accountError}</p>}
+              <div className="flex gap-3 pt-2">
+                <button onClick={handleSaveAccount} disabled={accountSaving} style={btnPrimary}>
+                  {accountSaving ? <span className="flex items-center justify-center gap-2"><span style={{ width:14,height:14,border:'2px solid rgba(255,255,255,0.3)',borderTopColor:'white',borderRadius:'50%',display:'inline-block',animation:'spin 0.8s linear infinite' }}/> Saving...</span> : <><Save size={14} style={{ display:'inline',marginRight:6 }}/> Save Changes</>}
+                </button>
+                <button onClick={()=>setShowAccount(false)} style={{ ...btnPrimary, background:'rgba(255,255,255,0.06)', boxShadow:'none', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.7)' }}>Cancel</button>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* INCOMING CALL */}
+      <AnimatePresence>
+        {incomingCall && <IncomingCall caller={incomingCall.fromUser} callType={incomingCall.callType} onAccept={acceptCall} onReject={rejectCall}/>}
+      </AnimatePresence>
+
+      {/* ACTIVE CALL */}
+      <AnimatePresence>
+        {activeCall && <ActiveCall callType={activeCall.callType} remoteUser={activeCall.remoteUser} onEnd={endCall} localVideoRef={localVideoRef} remoteVideoRef={remoteVideoRef} onScreenShare={toggleScreenShare} screenSharing={screenSharing}/>}
+      </AnimatePresence>
+
+      {/* IMAGE VIEWER */}
+      <AnimatePresence>
+        {imageViewer && <ImageViewer src={imageViewer} onClose={()=>setImageViewer(null)} />}
+      </AnimatePresence>
+
+      {/* ── ADMIN USERS PANEL ── */}
+      {showAdminUsers && (
+        <div style={{ position:'fixed',inset:0,zIndex:50,background:'rgba(0,5,20,0.85)',backdropFilter:'blur(10px)',display:'flex',alignItems:'center',justifyContent:'center',padding:20 }}
+          onClick={()=>setShowAdminUsers(false)}>
+          <div onClick={e=>e.stopPropagation()} style={{ borderRadius:20,padding:32,background:'rgba(3,8,28,0.98)',border:'1px solid rgba(245,158,11,0.3)',boxShadow:'0 0 100px rgba(245,158,11,0.1),0 40px 80px rgba(0,0,0,0.8)',width:'100%',maxWidth:560,maxHeight:'85vh',overflowY:'auto' }}>
+            <div style={{ display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:24 }}>
+              <h2 style={{ fontSize:18,fontWeight:700,color:'white',margin:0 }}>👑 Admin Panel</h2>
+              <button onClick={()=>{setShowAdminUsers(false);setAdminSearch('');}} style={{ color:'rgba(150,180,255,0.5)',background:'none',border:'none',cursor:'pointer',fontSize:18 }}>✕</button>
+            </div>
+            <div style={{ display:'flex',gap:8,marginBottom:20,flexWrap:'wrap' }}>
+              {['announcements','tech-updates','job-notifications'].map(ch => (
+                <div key={ch} style={{ padding:'4px 10px',borderRadius:8,fontSize:11,background:'rgba(74,144,226,0.1)',border:'1px solid rgba(74,144,226,0.2)',color:'rgba(150,180,255,0.7)' }}>
+                  {ch==='announcements'?'📢':ch==='tech-updates'?'💻':'💼'} {ch}
+                </div>
+              ))}
+            </div>
+            {/* Search bar */}
+            <div style={{ position:'relative',marginBottom:16 }}>
+              <input
+                type="text"
+                value={adminSearch}
+                onChange={e => setAdminSearch(e.target.value)}
+                placeholder="Search by username or User ID (e.g. CSP-VITS-000002)..."
+                style={{ width:'100%',padding:'10px 16px 10px 38px',borderRadius:10,fontSize:13,background:'rgba(255,255,255,0.06)',border:'1px solid rgba(74,144,226,0.3)',color:'white',outline:'none',boxSizing:'border-box',fontFamily:'inherit',transition:'all 0.2s' }}
+                onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';e.target.style.boxShadow='0 0 0 3px rgba(74,144,226,0.12)';}}
+                onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.3)';e.target.style.boxShadow='none';}}
+              />
+              <span style={{ position:'absolute',left:12,top:'50%',transform:'translateY(-50%)',fontSize:15,pointerEvents:'none' }}>🔍</span>
+              {adminSearch && (
+                <button onClick={()=>setAdminSearch('')}
+                  style={{ position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',background:'none',border:'none',color:'rgba(150,180,255,0.6)',cursor:'pointer',fontSize:16 }}>✕</button>
+              )}
+            </div>
+
+            <p style={{ fontSize:11,color:'rgba(150,180,255,0.5)',marginBottom:16,textTransform:'uppercase',letterSpacing:1,fontWeight:700 }}>
+              Users & Permissions {adminSearch && <span style={{ color:'#4A90E2' }}>— filtering results</span>}
+            </p>
+            <div style={{ display:'flex',flexDirection:'column',gap:12 }}>
+              {adminUsers.filter(u => u.id !== user.id).length === 0 && (
+                <p style={{ textAlign:'center',color:'rgba(150,180,255,0.4)',fontSize:14,padding:24 }}>No other users yet</p>
+              )}
+              {adminUsers.filter(u => u.id !== user.id).length > 0 && 
+               adminSearch &&
+               adminUsers.filter(u => {
+                 if (u.id === user.id) return false;
+                 const q = adminSearch.toLowerCase();
+                 const generatedCode = u.user_code || `CSP-${user.companyCode}-${String(u.id).padStart(6,'0')}`;
+                 return u.username.toLowerCase().includes(q) || generatedCode.toLowerCase().includes(q) || String(u.id).includes(q);
+               }).length === 0 && (
+                <p style={{ textAlign:'center',color:'rgba(150,180,255,0.4)',fontSize:14,padding:16 }}>No users match "<strong style={{color:'#4A90E2'}}>{adminSearch}</strong>"</p>
+              )}
+              {adminUsers.filter(u => {
+                if (u.id === user.id) return false;
+                if (!adminSearch) return true;
+                const q = adminSearch.toLowerCase();
+                // Generate code if missing using company code
+                const generatedCode = u.user_code || `CSP-${user.companyCode}-${String(u.id).padStart(6,'0')}`;
+                return (
+                  u.username.toLowerCase().includes(q) ||
+                  generatedCode.toLowerCase().includes(q) ||
+                  String(u.id).includes(q)
+                );
+              }).map(u => {
+                const userPerms = allPermissions.filter(p => Number(p.user_id) === Number(u.id)).map(p => p.channel);
+                // Generate code if missing
+                const displayCode = u.user_code || `CSP-${user.companyCode}-${String(u.id).padStart(6,'0')}`;
+                return (
+                  <div key={u.id} style={{ padding:16,borderRadius:14,background:'rgba(255,255,255,0.04)',border:'1px solid rgba(74,144,226,0.15)' }}>
+                    <div style={{ display:'flex',alignItems:'center',gap:12,marginBottom:u.role==='member'?12:6 }}>
+                      <Avatar user={u} size={36} />
+                      <div style={{ flex:1,minWidth:0 }}>
+                        <p style={{ fontSize:14,fontWeight:700,color:'white',margin:0 }}>{u.username}</p>
+                        <p style={{ fontSize:11,fontFamily:'monospace',color:'rgba(100,140,255,0.6)',margin:0 }}>{u.user_code || `CSP-${user.companyCode}-${String(u.id).padStart(6,'0')}`}</p>
+                      </div>
+                      <select value={u.role} onChange={e => handleSetRole(u.id, e.target.value)}
+                        style={{ padding:'6px 10px',borderRadius:8,fontSize:12,background:'rgba(255,255,255,0.08)',border:'1px solid rgba(74,144,226,0.3)',color:'white',cursor:'pointer',outline:'none',fontFamily:'inherit' }}>
+                        <option value="member" style={{ background:'#050d1f' }}>👤 Member</option>
+                        <option value="team_lead" style={{ background:'#050d1f' }}>⭐ Team Lead</option>
+                        <option value="admin" style={{ background:'#050d1f' }}>👑 Admin</option>
+                      </select>
+                    </div>
+                    {u.role === 'member' && (
+                      <div>
+                        <p style={{ fontSize:11,color:'rgba(150,180,255,0.5)',marginBottom:8 }}>Channel Permissions:</p>
+                        <div style={{ display:'flex',gap:8,flexWrap:'wrap' }}>
+                          {['tech-updates','job-notifications'].map(ch => {
+                            const hasPerm = userPerms.includes(ch);
+                            return (
+                              <button key={ch} onClick={() => hasPerm ? handleRevokePermission(u.id,ch) : handleGrantPermission(u.id,ch)}
+                                style={{ fontSize:12,padding:'6px 14px',borderRadius:8,fontWeight:600,cursor:'pointer',fontFamily:'inherit',
+                                  background:hasPerm?'rgba(34,197,94,0.2)':'rgba(255,255,255,0.06)',
+                                  border:hasPerm?'1px solid rgba(34,197,94,0.4)':'1px solid rgba(74,144,226,0.2)',
+                                  color:hasPerm?'#22c55e':'rgba(150,180,255,0.6)' }}>
+                                {hasPerm?'✓':'+'} {ch==='tech-updates'?'💻 Tech Updates':'💼 Job Notifications'}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {u.role==='team_lead' && <p style={{ fontSize:11,color:'rgba(245,158,11,0.7)',margin:0 }}>⭐ Can post in Tech Updates & Job Notifications</p>}
+                    {u.role==='admin' && <p style={{ fontSize:11,color:'rgba(74,144,226,0.7)',margin:0 }}>👑 Full access to all channels</p>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <video ref={localVideoRef} autoPlay playsInline muted className="hidden"/>
+      <video ref={remoteVideoRef} autoPlay playsInline className="hidden"/>
+
+      <style>{`
+        @keyframes spin { to{transform:rotate(360deg)} }
+        * { box-sizing:border-box; }
+      `}</style>
+    </div>
+  );
+}
