@@ -16,7 +16,7 @@ import { useTheme } from '../context/ThemeContext';
 import { useToast } from '../context/ToastContext';
 import EmojiPicker from 'emoji-picker-react';
 
-const API = 'http://localhost:5000/api';
+const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
 const formatUID = (id) => {
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const letterIndex = Math.floor((id - 1) / 9999) % 26;
@@ -77,7 +77,7 @@ const Avatar = ({ user, size = 38, showStatus = false }) => {
   return (
     <div className="relative flex-shrink-0" style={{ width: size, height: size }}>
       {user?.avatar_url ? (
-        <img src={`http://localhost:5000${user.avatar_url}`} alt=""
+        <img src={`https://gong-unbend-chief.ngrok-free.dev${user.avatar_url}`} alt=""
           className="rounded-full object-cover w-full h-full avatar-ring" />
       ) : (
         <div className="rounded-full flex items-center justify-center text-white font-bold w-full h-full"
@@ -255,7 +255,28 @@ export default function Chat() {
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
-  const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  const rtcConfig = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
+    ]
+  };
 
   const cleanupCall = useCallback(() => {
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
@@ -284,7 +305,7 @@ export default function Chat() {
   };
 
   useEffect(() => {
-    socket = io('http://localhost:5000');
+    socket = io('https://gong-unbend-chief.ngrok-free.dev');
     socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
     socket.on('onlineUsers', setOnlineUsers);
     socket.on('newMessage', msg => {
@@ -431,7 +452,7 @@ export default function Chat() {
       const fd = new FormData();
       fd.append('image', file);
       const r = await axios.post(`${API}/messages/upload-image`, fd);
-      const imageUrl = `http://localhost:5000${r.data.image_url}`;
+      const imageUrl = `https://gong-unbend-chief.ngrok-free.dev${r.data.image_url}`;
       const text = `[IMAGE]${imageUrl}[/IMAGE]`;
 
       if (activeDM) {
@@ -577,49 +598,75 @@ export default function Chat() {
   // ── SCREEN SHARE ──
   const toggleScreenShare = async () => {
     if (screenSharing) {
-      // Stop screen share
+      // Stop screen share - restore camera
       if (screenStreamRef.current) {
         screenStreamRef.current.getTracks().forEach(t => t.stop());
         screenStreamRef.current = null;
       }
-      // Restore camera
+      // Restore original camera track
       if (localStreamRef.current && peerConnectionRef.current) {
         const videoTrack = localStreamRef.current.getVideoTracks()[0];
         if (videoTrack) {
           const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video');
-          if (sender) sender.replaceTrack(videoTrack);
+          if (sender) {
+            await sender.replaceTrack(videoTrack);
+            if (localVideoRef.current) localVideoRef.current.srcObject = localStreamRef.current;
+          }
         }
       }
       setScreenSharing(false);
+      addToast({ title:'Screen share stopped', message:'' });
     } else {
+      // Check if browser supports screen sharing
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        addToast({ title:'Not supported', message:'Screen sharing not supported in this browser' });
+        return;
+      }
       try {
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ 
+          video: { cursor: 'always' }, 
+          audio: false 
+        });
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
-        // Replace video track in peer connection
+
+        // Replace video track in WebRTC peer connection
         if (peerConnectionRef.current) {
           const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video');
-          if (sender) sender.replaceTrack(screenTrack);
+          if (sender) {
+            await sender.replaceTrack(screenTrack);
+          }
         }
-        // Show screen in local video
+
+        // Show screen in local video preview
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = screenStream;
         }
-        screenTrack.onended = () => {
-          setScreenSharing(false);
+
+        // Auto stop when user clicks "Stop sharing" in browser
+        screenTrack.onended = async () => {
           screenStreamRef.current = null;
-          // Restore camera track
+          setScreenSharing(false);
+          // Restore camera
           if (localStreamRef.current && peerConnectionRef.current) {
             const videoTrack = localStreamRef.current.getVideoTracks()[0];
             if (videoTrack) {
               const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video');
-              if (sender) sender.replaceTrack(videoTrack);
+              if (sender) {
+                await sender.replaceTrack(videoTrack);
+                if (localVideoRef.current) localVideoRef.current.srcObject = localStreamRef.current;
+              }
             }
           }
+          addToast({ title:'Screen share stopped', message:'' });
         };
+
         setScreenSharing(true);
+        addToast({ title:'Screen sharing started', message:'Your screen is now visible to the other person' });
       } catch(e) {
-        if (e.name !== 'NotAllowedError') addToast({ title:'Screen share failed', message:e.message });
+        if (e.name !== 'NotAllowedError') {
+          addToast({ title:'Screen share failed', message: e.message || 'Could not share screen' });
+        }
       }
     }
   };
@@ -689,9 +736,11 @@ export default function Chat() {
 
   const renderMessage = (msg) => {
     const isOwn = msg.user_id===user.id || msg.from_user_id===user.id;
-    const imageMatch = msg.text?.match(/\[IMAGE\](.*?)\[\/IMAGE\]/);
+    const isDeleted2 = msg.deleted === 1 || msg.text === 'This message was deleted';
+    const imageMatch = !isDeleted2 && msg.text?.match(/\[IMAGE\](.*?)\[\/IMAGE\]/);
+    const imageUrl2 = imageMatch ? imageMatch[1].replace('http://localhost:5000', window.location.origin.includes('localhost') ? 'http://localhost:5000' : window.location.origin).replace(/https:\/\/[a-z0-9-]+\.ngrok-free\.(app|dev)/, window.location.origin.includes('localhost') ? 'https://gong-unbend-chief.ngrok-free.dev' : window.location.origin) : null;
     const isMissedCall = msg.deleted!==1 && msg.text && (msg.text.includes('Missed')||msg.text.includes('missed')) && (msg.text.includes('📞')||msg.text.includes('📹'));
-    const isDeleted = msg.deleted===1 || msg.text==='This message was deleted';
+    const isDeleted = isDeleted2;
     const msgReactions = reactions[msg.id] || {};
     const isChannel = !!activeChannel;
 
@@ -729,10 +778,10 @@ export default function Chat() {
             {isDeleted ? (
               <p className="text-xs italic" style={{ color:'rgba(150,180,255,0.4)' }}>🚫 This message was deleted</p>
             ) : imageMatch ? (
-              <img src={imageMatch[1]} alt="shared"
+              <img src={imageUrl2} alt="shared"
                 className="max-w-xs rounded-xl cursor-pointer transition-all hover:scale-105 hover:shadow-lg"
                 style={{ boxShadow:'0 4px 20px rgba(74,144,226,0.2)' }}
-                onClick={e=>{e.stopPropagation();setImageViewer(imageMatch[1]);}}
+                onClick={e=>{e.stopPropagation();setImageViewer(imageUrl2);}}
               />
             ) : isMissedCall ? (
               <div className="flex items-center gap-2"><PhoneMissed size={14} style={{ color:'#ef4444' }} /><span className="text-sm" style={{ color:'#ef4444' }}>{msg.text}</span></div>
@@ -1205,7 +1254,7 @@ export default function Chat() {
               {[
                 { icon:<Reply size={13}/>, label:'Reply', action:()=>{setReplyTo(contextMenu.msg);setContextMenu(null);} },
                 { icon:<Forward size={13}/>, label:'Forward', action:()=>{setForwardMsg(contextMenu.msg);setContextMenu(null);} },
-                ...(contextMenu.msg.user_id===user.id||contextMenu.msg.from_user_id===user.id ? [
+                ...(Number(contextMenu.msg.user_id)===Number(user.id)||Number(contextMenu.msg.from_user_id)===Number(user.id) ? [
                   ...(!contextMenu.msg.text?.includes('[IMAGE]') ? [{ icon:<Edit2 size={13}/>, label:'Edit', action:()=>{setEditingMsg({...contextMenu.msg,type:activeDM?'private':activeGroup?'group':'channel'});setEditText(contextMenu.msg.text);setContextMenu(null);} }] : []),
                   { icon:<Trash2 size={13}/>, label:'Delete', action:()=>handleDeleteMessage(contextMenu.msg), red:true },
                 ] : []),

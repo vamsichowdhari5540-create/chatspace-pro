@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
-const API = 'http://localhost:5000/api';
+const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
 const AuthContext = createContext();
 
 // Set axios default auth header

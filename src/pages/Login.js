@@ -4,6 +4,8 @@ import { useAuth } from '../context/AuthContext';
 import { gsap } from 'gsap';
 import Globe from 'react-globe.gl';
 import axios from 'axios';
+axios.defaults.headers.common['ngrok-skip-browser-warning'] = 'true';
+
 
 const ARCS = [
   { startLat:51.5,startLng:-0.1,endLat:40.7,endLng:-74.0 },
@@ -241,7 +243,7 @@ export default function Login() {
   useEffect(() => {
     const match = userId?.match(/^CSP-([A-Z0-9]+)-/i);
     if (match) {
-      axios.get(`http://localhost:5000/api/auth/company/${match[1]}`)
+      axios.get(`https://gong-unbend-chief.ngrok-free.dev/api/auth/company/${match[1]}`)
         .then(r => setCompanyName(r.data.name))
         .catch(() => setCompanyName(''));
     } else {
@@ -255,7 +257,7 @@ export default function Login() {
     if (!userId || !password) { setError('All fields required'); return; }
     setError(''); setLoading(true);
     try {
-      await axios.post('http://localhost:5000/api/auth/login', { userId, password });
+      await axios.post('https://gong-unbend-chief.ngrok-free.dev/api/auth/login', { userId, password });
       setAccessStatus('granted');
     } catch (err) {
       setAccessStatus('denied');

@@ -7,11 +7,24 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { 
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  transports: ['websocket', 'polling']
+});
 
 app.use(cors());
+
+// ── BYPASS NGROK WARNING FOR ALL REQUESTS ──
+app.use((req, res, next) => {
+  res.setHeader('ngrok-skip-browser-warning', 'true');
+  next();
+});
+
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// ── SERVE REACT BUILD ──
+app.use(express.static(path.join(__dirname, '../build')));
 
 // ── ROUTES ──
 app.use('/api/auth', require('./routes/auth'));
@@ -73,6 +86,11 @@ io.on('connection', (socket) => {
     delete onlineUsers[socket.id];
     io.emit('onlineUsers', Object.values(onlineUsers));
   });
+});
+
+// ── CATCH ALL - Send React app for unknown routes ──
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../build', 'index.html'));
 });
 
 const PORT = process.env.PORT || 5000;

@@ -5,7 +5,7 @@ import { gsap } from 'gsap';
 import Globe from 'react-globe.gl';
 import axios from 'axios';
 
-const API = 'http://localhost:5000/api';
+const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
 
 const ARCS = [
   { startLat:51.5,startLng:-0.1,endLat:40.7,endLng:-74.0 },
@@ -362,7 +362,7 @@ export default function Register() {
                     Object.assign(e.target.style, blurStyle);
                     if (companyCode) {
                       try {
-                        const r = await axios.get(`http://localhost:5000/api/auth/company/${companyCode}`);
+                        const r = await axios.get(`https://gong-unbend-chief.ngrok-free.dev/api/auth/company/${companyCode}`);
                         setCompanyName(r.data.name);
                         setCompanyError('');
                       } catch { setCompanyError('Company not found'); setCompanyName(''); }
