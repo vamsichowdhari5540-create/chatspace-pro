@@ -359,3 +359,45 @@ html:not(.dark) .bg-white\/10 { background: rgba(74,144,226,0.1) !important; }
 
 input::placeholder { color: rgba(150, 180, 255, 0.4) !important; }
 textarea::placeholder { color: rgba(150, 180, 255, 0.4) !important; }
+
+/* ── LIGHT THEME FIXES ── */
+body.light .message-bubble .text-white {
+  color: #1a1a2e !important;
+}
+
+/* Received messages in light theme - dark text on light background */
+body.light .message-bubble .flex-row .text-white {
+  color: #1a1a2e !important;
+}
+
+/* Keep sent messages white text on blue background */
+body.light .message-bubble .flex-row-reverse .text-white {
+  color: #ffffff !important;
+}
+
+/* Fix message bubble backgrounds in light theme */
+body.light .message-bubble > div > div > div {
+  border-color: rgba(74, 144, 226, 0.3) !important;
+}
+
+/* Received message bubble in light theme */
+body.light .message-bubble .flex-row > div > div {
+  background: rgba(255, 255, 255, 0.9) !important;
+  border: 1px solid rgba(74, 144, 226, 0.25) !important;
+}
+
+/* Fix text color inside received bubbles */
+body.light .message-bubble .flex-row p.text-white,
+body.light .message-bubble .flex-row p.text-sm {
+  color: #1a1a2e !important;
+}
+
+/* Fix username color in light theme */
+body.light .message-bubble span.text-xs {
+  color: rgba(50, 80, 150, 0.8) !important;
+}
+
+/* Fix timestamp in light theme */
+body.light .message-bubble .text-xs {
+  color: rgba(50, 80, 150, 0.6) !important;
+}

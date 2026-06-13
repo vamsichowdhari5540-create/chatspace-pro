@@ -54,6 +54,46 @@ router.post('/upload-image', auth, (req, res) => {
   });
 });
 
+// ── FILE UPLOAD ──
+const filesDir = path.join(__dirname, '../uploads/files');
+ensureDir(filesDir);
+
+const fileStorage = multer.diskStorage({
+  destination: (req, file, cb) => { ensureDir(filesDir); cb(null, filesDir); },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    const name = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9]/g, '_');
+    cb(null, `${name}_${Date.now()}${ext}`);
+  }
+});
+
+const fileUpload = multer({
+  storage: fileStorage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+  fileFilter: (req, file, cb) => {
+    // Block executable files for safety
+    const blocked = ['.exe', '.bat', '.cmd', '.sh', '.msi'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (blocked.includes(ext)) cb(new Error('Executable files not allowed'));
+    else cb(null, true);
+  }
+});
+
+router.post('/upload-file', auth, (req, res) => {
+  fileUpload.single('file')(req, res, (err) => {
+    if (err) { console.error('File upload error:', err.message); return res.status(500).json({ message: err.message || 'Upload failed' }); }
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const fileUrl = `/uploads/files/${req.file.filename}`;
+    console.log('✅ File uploaded:', fileUrl, 'Size:', req.file.size);
+    res.json({ 
+      file_url: fileUrl, 
+      file_name: req.file.originalname,
+      file_size: req.file.size,
+      file_type: path.extname(req.file.originalname).toLowerCase().replace('.', '')
+    });
+  });
+});
+
 // ── GET CHANNEL MESSAGES ──
 router.get('/:room', auth, (req, res) => {
   if (req.params.room === 'private') return res.status(400).json({ message: 'Use /private/:userId' });

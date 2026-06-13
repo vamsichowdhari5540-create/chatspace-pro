@@ -22,6 +22,7 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads/files', express.static(path.join(__dirname, 'uploads/files')));
 
 // ── SERVE REACT BUILD ──
 app.use(express.static(path.join(__dirname, '../build')));
@@ -68,6 +69,30 @@ io.on('connection', (socket) => {
   });
 
   socket.on('editMessage', (data) => io.emit('messageEdited', data));
+  // Group events - only notify members, not everyone
+  socket.on('groupCreated', ({ group, memberUsernames }) => {
+    // Notify only online users who are members
+    Object.values(onlineUsers).forEach(u => {
+      if (memberUsernames && memberUsernames.includes(u.username)) {
+        io.to(u.socketId).emit('groupCreated', { group });
+      }
+    });
+    // Also notify the creator
+    socket.emit('groupCreated', { group });
+  });
+
+  socket.on('groupDeleted', ({ groupId, memberIds }) => {
+    // Notify only members of that group
+    if (memberIds && memberIds.length) {
+      Object.values(onlineUsers).forEach(u => {
+        if (memberIds.includes(u.id)) {
+          io.to(u.socketId).emit('groupDeleted', { groupId });
+        }
+      });
+    } else {
+      io.emit('groupDeleted', { groupId });
+    }
+  });
   socket.on('deleteMessage', (data) => io.emit('messageDeleted', data));
   socket.on('messageSeen', (data) => io.emit('messageSeen', data));
 

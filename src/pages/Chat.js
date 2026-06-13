@@ -217,11 +217,14 @@ export default function Chat() {
   const [groupMembers, setGroupMembers] = useState('');
   const [groupError, setGroupError] = useState('');
   const [groupMemberSearch, setGroupMemberSearch] = useState('');
+  const [groupSearch, setGroupSearch] = useState('');
   const [selectedGroupMembers, setSelectedGroupMembers] = useState([]);
   const [contextMenu, setContextMenu] = useState(null);
   const [groupMembersList, setGroupMembersList] = useState([]);
   const [reactions, setReactions] = useState({});
   const [addMemberInput, setAddMemberInput] = useState('');
+  const [addMemberSearch, setAddMemberSearch] = useState('');
+  const [showAddMemberDropdown, setShowAddMemberDropdown] = useState(false);
   const [adminError, setAdminError] = useState('');
   const [pinnedMessages, setPinnedMessages] = useState([]);
   const [editingMsg, setEditingMsg] = useState(null);
@@ -244,10 +247,12 @@ export default function Chat() {
   const [selectedUser, setSelectedUser] = useState(null);
   const [userPermissions, setUserPermissions] = useState([]);
   const [adminSearch, setAdminSearch] = useState('');
+  const [unreadCounts, setUnreadCounts] = useState({}); // { 'channel_announcements': 3, 'dm_2': 5, 'group_1': 2 }
   const [imageViewer, setImageViewer] = useState(null); // { src, zoom }
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const fileShareInputRef = useRef(null);
   const avatarInputRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const missedCallTimerRef = useRef(null);
@@ -308,15 +313,27 @@ export default function Chat() {
     socket = io('https://gong-unbend-chief.ngrok-free.dev');
     socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
     socket.on('onlineUsers', setOnlineUsers);
+    socket.on('groupCreated', () => loadGroups());
+    socket.on('groupDeleted', ({ groupId }) => {
+      setGroups(prev => prev.filter(g => g.id !== groupId));
+      if (activeGroup?.id === groupId) { setActiveGroup(null); setMessages([]); }
+    });
     socket.on('newMessage', msg => {
+      // Add unread if not currently viewing this channel
+      if (msg.room !== activeChannel) addUnread(`channel_${msg.room}`);
       setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
       if (msg.user_id!==user.id) { addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} }); showPushNotif(msg.username, msg.text?.substring(0,60)||'📷'); }
     });
     socket.on('newPrivateMessage', msg => {
+      // Add unread if not currently viewing this DM
+      const dmId = msg.from_user_id === user.id ? msg.to_user_id : msg.from_user_id;
+      if (!activeDM || activeDM.id !== dmId) addUnread(`dm_${dmId}`);
       setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
       if (msg.from_user_id!==user.id) { addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} }); showPushNotif(msg.username, msg.text?.substring(0,60)||'📷'); }
     });
-    socket.on('newGroupMessage', msg => { setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]); });
+    socket.on('newGroupMessage', msg => {
+      // Add unread if not currently viewing this group
+      if (!activeGroup || activeGroup.id !== msg.group_id) addUnread(`group_${msg.group_id}`); setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]); });
     socket.on('userTyping', ({ username, isTyping }) => { setTypingUsers(prev => isTyping ? [...prev.filter(u=>u!==username),username] : prev.filter(u=>u!==username)); });
     socket.on('messageReaction', ({ messageId, reactions:r }) => { setReactions(prev => ({...prev,[messageId]:r})); });
     socket.on('messageEdited', ({ id, text }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text,edited:1}:m)); });
@@ -359,6 +376,14 @@ export default function Chat() {
   const loadGroups = async () => { try { const r = await axios.get(`${API}/groups`); setGroups(r.data); } catch {} };
   const loadBlockedUsers = async () => { try { const r = await axios.get(`${API}/users/blocked`); setBlockedUsers(r.data); } catch {} };
 
+  const addUnread = (key) => {
+    setUnreadCounts(prev => ({ ...prev, [key]: (prev[key] || 0) + 1 }));
+  };
+
+  const clearUnread = (key) => {
+    setUnreadCounts(prev => ({ ...prev, [key]: 0 }));
+  };
+
   const loadAdminUsers = async () => {
     try {
       const [usersRes, permsRes] = await Promise.all([
@@ -369,6 +394,24 @@ export default function Chat() {
       setAllPermissions(permsRes.data);
     } catch(err) {
       console.error('loadAdminUsers error:', err.response?.data || err.message);
+    }
+  };
+
+  const handleDeleteGroup = async (groupId) => {
+    if (!window.confirm('Are you sure you want to delete this group?')) return;
+    try {
+      // Get members first so we can notify them
+      const membersRes = await axios.get(`${API}/groups/${groupId}/members`);
+      const memberIds = membersRes.data.map(m => m.id);
+      
+      await axios.delete(`${API}/groups/${groupId}`);
+      setGroups(prev => prev.filter(g => g.id !== groupId));
+      if (activeGroup?.id === groupId) { setActiveGroup(null); setMessages([]); }
+      addToast({ title:'Group deleted!', message:'' });
+      // Notify only group members via socket
+      if (socket) socket.emit('groupDeleted', { groupId, memberIds });
+    } catch(err) {
+      addToast({ title:'Error', message: err.response?.data?.message || 'Failed to delete group' });
     }
   };
 
@@ -409,7 +452,7 @@ export default function Chat() {
 
   const switchChannel = async ch => {
     setActiveChannel(ch); setActiveDM(null); setActiveGroup(null); loadMessages('channel',ch);
-    // Admin can always post
+    clearUnread(`channel_${ch}`);
     if (user.role === 'admin') { setCanPost(true); return; }
     try {
       const r = await axios.get(`${API}/admin/can-post/${ch}`);
@@ -419,10 +462,15 @@ export default function Chat() {
   const switchDM = u => { setActiveDM(u); setActiveChannel(null); setActiveGroup(null); loadMessages('dm',u.id); };
   const switchGroup = async g => {
     setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group',g.id);
+    clearUnread(`group_${g.id}`);
     try {
-      const [members,pinned] = await Promise.all([axios.get(`${API}/groups/${g.id}/members`), axios.get(`${API}/groups/${g.id}/pinned`)]);
-      setGroupMembersList(members.data); setPinnedMessages(pinned.data);
+      const membersRes = await axios.get(`${API}/groups/${g.id}/members`);
+      setGroupMembersList(membersRes.data);
     } catch {}
+    try {
+      const pinnedRes = await axios.get(`${API}/groups/${g.id}/pinned`);
+      setPinnedMessages(pinnedRes.data || []);
+    } catch { setPinnedMessages([]); }
   };
 
   const sendMessage = async () => {
@@ -442,6 +490,40 @@ export default function Chat() {
       socket.emit('typing', { room:activeChannel, username:user.username, isTyping:true });
       clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = setTimeout(() => socket.emit('typing', { room:activeChannel, username:user.username, isTyping:false }), 1500);
+    }
+  };
+
+  const handleFileShare = async e => {
+    const file = e.target.files[0]; if (!file) return;
+    e.target.value = '';
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      addToast({ title:'Uploading...', message:file.name });
+      const r = await axios.post(`${API}/messages/upload-file`, fd);
+      const baseUrl = window.location.origin.includes('localhost') ? 'https://gong-unbend-chief.ngrok-free.dev' : window.location.origin;
+      const fileUrl = `${baseUrl}${r.data.file_url}`;
+      const text = `[FILE]${JSON.stringify({ url: fileUrl, name: r.data.file_name, size: r.data.file_size, type: r.data.file_type })}[/FILE]`;
+
+      if (activeDM) {
+        const mr = await axios.post(`${API}/messages/private`, { to_user_id: activeDM.id, text });
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        if (socket) socket.emit('sendPrivateMessage', { ...finalMsg, to_user_id: activeDM.id });
+        setMessages(prev => [...prev, finalMsg]);
+      } else if (activeGroup) {
+        const mr = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text });
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        if (socket) socket.emit('sendGroupMessage', { ...finalMsg, group_id: activeGroup.id });
+        setMessages(prev => [...prev, finalMsg]);
+      } else if (activeChannel) {
+        const mr = await axios.post(`${API}/messages`, { room: activeChannel, text });
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        if (socket) socket.emit('sendMessage', { ...finalMsg, room: activeChannel });
+        setMessages(prev => [...prev, finalMsg]);
+      }
+      addToast({ title:'File sent!', message: file.name });
+    } catch(err) {
+      addToast({ title:'Upload failed', message: err.response?.data?.message || 'Could not send file' });
     }
   };
 
@@ -533,6 +615,7 @@ export default function Chat() {
       socket.emit('userOnline', { id:user.id, username:accountForm.username, avatar_color:accountForm.avatar_color, status:accountForm.status });
       await axios.put(`${API}/users/status`, { status:accountForm.status });
       addToast({ title:'Profile saved!', message:'' });
+      setShowAccount(false); // Close modal and return to chat
     } catch (err) { setAccountError(err.response?.data?.message||'Failed to save'); }
     setAccountSaving(false);
   };
@@ -672,14 +755,21 @@ export default function Chat() {
   };
 
   const handleReaction = (msgId, emoji) => { socket.emit('addReaction', { messageId:msgId, emoji, userId:user.id, username:user.username }); setContextMenu(null); };
-  const handleContextMenu = (e, msg) => { e.preventDefault(); setContextMenu({ x:e.clientX, y:e.clientY, msg }); };
+  const handleContextMenu = (e, msg) => {
+    e.preventDefault();
+    const menuWidth = 190;
+    const menuHeight = 300;
+    const x = e.clientX + menuWidth > window.innerWidth ? e.clientX - menuWidth : e.clientX;
+    const y = e.clientY + menuHeight > window.innerHeight ? e.clientY - menuHeight : e.clientY;
+    setContextMenu({ x, y, msg });
+  };
 
   const handleCreateGroup = async () => {
     if (!groupName.trim()) { setGroupError('Enter a group name'); return; }
     if (!selectedGroupMembers.length) { setGroupError('Add at least one member'); return; }
     try {
       const memberUsernames = selectedGroupMembers.map(m => m.username);
-      await axios.post(`${API}/groups`, { name:groupName, memberUsernames });
+      const newGroup = await axios.post(`${API}/groups`, { name:groupName, memberUsernames });
       setShowCreateGroup(false);
       setGroupName('');
       setGroupMembers('');
@@ -687,14 +777,26 @@ export default function Chat() {
       setSelectedGroupMembers([]);
       setGroupMemberSearch('');
       loadGroups();
+      // Notify only group members via socket so their sidebar updates
+      if (socket) socket.emit('groupCreated', { group: newGroup.data, memberUsernames });
     }
     catch (err) { setGroupError(err.response?.data?.message || 'Failed to create group'); }
   };
 
-  const handleAddMember = async () => {
-    if (!addMemberInput.trim()) return;
-    try { await axios.post(`${API}/groups/${activeGroup.id}/members`, { username:addMemberInput }); setAddMemberInput(''); setAdminError(''); const r = await axios.get(`${API}/groups/${activeGroup.id}/members`); setGroupMembersList(r.data); }
-    catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
+  const handleAddMember = async (selectedUser) => {
+    const username = selectedUser ? selectedUser.username : addMemberInput.trim();
+    if (!username) return;
+    try {
+      await axios.post(`${API}/groups/${activeGroup.id}/members`, { username });
+      setAddMemberInput('');
+      setAddMemberSearch('');
+      setShowAddMemberDropdown(false);
+      setAdminError('');
+      const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
+      setGroupMembersList(r.data);
+      addToast({ title:'Member added!', message:`${username} added to group` });
+    }
+    catch (err) { setAdminError(err.response?.data?.message||'Failed to add member'); }
   };
 
   const handleRemoveMember = async (memberId) => {
@@ -708,8 +810,20 @@ export default function Chat() {
   };
 
   const handleMakeAdmin = async (memberId) => {
-    try { await axios.put(`${API}/groups/${activeGroup.id}/make-admin/${memberId}`); setActiveGroup(prev=>({...prev,admin_id:memberId})); setAdminError(''); loadGroups(); const r = await axios.get(`${API}/groups/${activeGroup.id}/members`); setGroupMembersList(r.data); }
-    catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
+    try {
+      await axios.put(`${API}/groups/${activeGroup.id}/make-admin/${memberId}`);
+      // Update local state
+      setActiveGroup(prev => ({ ...prev, admin_id: Number(memberId) }));
+      setGroups(prev => prev.map(g => g.id === activeGroup.id ? { ...g, admin_id: Number(memberId) } : g));
+      setAdminError('');
+      const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
+      setGroupMembersList(r.data);
+      addToast({ title:'Admin transferred!', message:'New admin assigned successfully' });
+    }
+    catch (err) {
+      console.error('Make admin error:', err.response?.data || err.message);
+      setAdminError(err.response?.data?.message || 'Failed to transfer admin');
+    }
   };
 
   const isOnline = id => onlineUsers.some(u=>u.id===id);
@@ -723,6 +837,32 @@ export default function Chat() {
   );
   const getChatTitle = () => activeDM ? activeDM.username : activeGroup ? activeGroup.name : `#${activeChannel}`;
 
+  const formatFileSize = (bytes) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024*1024) return `${(bytes/1024).toFixed(1)} KB`;
+    return `${(bytes/1024/1024).toFixed(1)} MB`;
+  };
+
+  const getFileIcon = (type) => {
+    const icons = {
+      pdf: '📄', doc: '📝', docx: '📝', xls: '📊', xlsx: '📊',
+      ppt: '📊', pptx: '📊', zip: '📦', rar: '📦', txt: '📃',
+      mp3: '🎵', mp4: '🎬', png: '🖼️', jpg: '🖼️', jpeg: '🖼️',
+      gif: '🖼️', csv: '📊', json: '⚙️', js: '⚙️', py: '⚙️',
+    };
+    return icons[type?.toLowerCase()] || '📎';
+  };
+
+  const getFileColor = (type) => {
+    const colors = {
+      pdf: '#ef4444', doc: '##4A90E2', docx: '#4A90E2',
+      xls: '#22c55e', xlsx: '#22c55e', zip: '#f59e0b',
+      rar: '#f59e0b', mp3: '#8b5cf6', mp4: '#8b5cf6',
+      ppt: '#f97316', pptx: '#f97316',
+    };
+    return colors[type?.toLowerCase()] || '#4A90E2';
+  };
+
   const formatLastSeen = (ts) => {
     if (!ts) return 'Never';
     const diff = Math.floor((new Date() - new Date(ts)) / 1000);
@@ -734,11 +874,27 @@ export default function Chat() {
 
   const COLORS = ['#4A90E2','#10b981','#ef4444','#f59e0b','#ec4899','#06b6d4','#8b5cf6','#f97316'];
 
+  // Unread badge component
+  const UnreadBadge = ({ count }) => {
+    if (!count) return null;
+    return (
+      <span style={{
+        background:'#ef4444', color:'white', fontSize:10, fontWeight:800,
+        borderRadius:10, minWidth:18, height:18, display:'flex',
+        alignItems:'center', justifyContent:'center', padding:'0 5px'
+      }}>
+        {count > 99 ? '99+' : count}
+      </span>
+    );
+  };
+
   const renderMessage = (msg) => {
     const isOwn = msg.user_id===user.id || msg.from_user_id===user.id;
     const isDeleted2 = msg.deleted === 1 || msg.text === 'This message was deleted';
     const imageMatch = !isDeleted2 && msg.text?.match(/\[IMAGE\](.*?)\[\/IMAGE\]/);
     const imageUrl2 = imageMatch ? imageMatch[1].replace('http://localhost:5000', window.location.origin.includes('localhost') ? 'http://localhost:5000' : window.location.origin).replace(/https:\/\/[a-z0-9-]+\.ngrok-free\.(app|dev)/, window.location.origin.includes('localhost') ? 'https://gong-unbend-chief.ngrok-free.dev' : window.location.origin) : null;
+    const fileMatch = !isDeleted2 && msg.text?.match(/\[FILE\](.*?)\[\/FILE\]/);
+    const fileData = fileMatch ? (() => { try { return JSON.parse(fileMatch[1]); } catch { return null; } })() : null;
     const isMissedCall = msg.deleted!==1 && msg.text && (msg.text.includes('Missed')||msg.text.includes('missed')) && (msg.text.includes('📞')||msg.text.includes('📹'));
     const isDeleted = isDeleted2;
     const msgReactions = reactions[msg.id] || {};
@@ -768,10 +924,10 @@ export default function Chat() {
             background: isDeleted ? 'rgba(255,255,255,0.04)' :
               isMissedCall ? 'rgba(239,68,68,0.1)' :
               isOwn ? 'linear-gradient(135deg, #4A90E2, #2563eb)' :
-              'rgba(255,255,255,0.07)',
+              dark ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.95)',
             border: isDeleted ? '1px solid rgba(255,255,255,0.08)' :
               isMissedCall ? '1px solid rgba(239,68,68,0.3)' :
-              isOwn ? 'none' : '1px solid rgba(74,144,226,0.15)',
+              isOwn ? 'none' : dark ? '1px solid rgba(74,144,226,0.15)' : '1px solid rgba(74,144,226,0.25)',
             borderRadius: isOwn ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
             boxShadow: isOwn ? '0 4px 15px rgba(74,144,226,0.25)' : 'none',
           }}>
@@ -783,10 +939,33 @@ export default function Chat() {
                 style={{ boxShadow:'0 4px 20px rgba(74,144,226,0.2)' }}
                 onClick={e=>{e.stopPropagation();setImageViewer(imageUrl2);}}
               />
+            ) : fileData ? (
+              <div style={{ minWidth:220, maxWidth:280 }}>
+                <div style={{ display:'flex', alignItems:'center', gap:12, padding:'12px 14px', borderRadius:14, background: isOwn ? 'rgba(255,255,255,0.12)' : 'rgba(74,144,226,0.1)', border: `1px solid ${getFileColor(fileData.type)}33` }}>
+                  {/* File icon */}
+                  <div style={{ width:42, height:42, borderRadius:10, background:`${getFileColor(fileData.type)}22`, border:`1.5px solid ${getFileColor(fileData.type)}55`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:22, flexShrink:0 }}>
+                    {getFileIcon(fileData.type)}
+                  </div>
+                  {/* File info */}
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <p style={{ fontSize:13, fontWeight:700, color:'white', margin:0, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }} title={fileData.name}>{fileData.name}</p>
+                    <p style={{ fontSize:11, color:'rgba(150,180,255,0.6)', margin:'2px 0 0', textTransform:'uppercase', letterSpacing:0.5 }}>
+                      {fileData.type?.toUpperCase() || 'FILE'} · {formatFileSize(fileData.size)}
+                    </p>
+                  </div>
+                </div>
+                {/* Download button */}
+                <a href={fileData.url} download={fileData.name} target="_blank" rel="noreferrer"
+                  style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:6, marginTop:6, padding:'7px 14px', borderRadius:10, background: isOwn ? 'rgba(255,255,255,0.15)' : 'rgba(74,144,226,0.15)', border: isOwn ? '1px solid rgba(255,255,255,0.2)' : '1px solid rgba(74,144,226,0.3)', color:'white', fontSize:12, fontWeight:600, textDecoration:'none', transition:'all 0.2s', cursor:'pointer' }}
+                  onMouseEnter={e=>e.currentTarget.style.background= isOwn ? 'rgba(255,255,255,0.25)' : 'rgba(74,144,226,0.25)'}
+                  onMouseLeave={e=>e.currentTarget.style.background= isOwn ? 'rgba(255,255,255,0.15)' : 'rgba(74,144,226,0.15)'}>
+                  ⬇ Download
+                </a>
+              </div>
             ) : isMissedCall ? (
               <div className="flex items-center gap-2"><PhoneMissed size={14} style={{ color:'#ef4444' }} /><span className="text-sm" style={{ color:'#ef4444' }}>{msg.text}</span></div>
             ) : (
-              <p className="text-sm leading-relaxed break-words text-white">{msg.text}</p>
+              <p className="text-sm leading-relaxed break-words" style={{ color: isOwn ? 'white' : dark ? 'white' : '#1a1a2e' }}>{msg.text}</p>
             )}
             {msg.edited===1 && !isDeleted && <span className="text-xs opacity-50 ml-1">(edited)</span>}
           </div>
@@ -867,6 +1046,28 @@ export default function Chat() {
           <button onClick={e=>{e.stopPropagation();setZoom(1);setPos({x:0,y:0});}}
             className="px-3 h-9 rounded-full text-white text-xs font-semibold transition-all hover:scale-110"
             style={{ background:'rgba(74,144,226,0.3)', border:'1px solid rgba(74,144,226,0.5)' }}>Reset</button>
+          <button onClick={async e=>{
+            e.stopPropagation();
+            try {
+              const response = await fetch(src);
+              const blob = await response.blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `chatspace_image_${Date.now()}.${blob.type.split('/')[1] || 'jpg'}`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            } catch {
+              // Fallback - open in new tab
+              window.open(src, '_blank');
+            }
+          }}
+            className="px-3 h-9 rounded-full text-white text-xs font-semibold flex items-center gap-1 transition-all hover:scale-110"
+            style={{ background:'rgba(34,197,94,0.3)', border:'1px solid rgba(34,197,94,0.5)' }}>
+            ⬇ Download
+          </button>
           <button onClick={onClose}
             className="w-9 h-9 rounded-full flex items-center justify-center text-white transition-all hover:scale-110"
             style={{ background:'rgba(239,68,68,0.3)', border:'1px solid rgba(239,68,68,0.5)' }}>✕</button>
@@ -954,7 +1155,25 @@ export default function Chat() {
             <p className="text-xs font-bold uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Groups</p>
             <button onClick={()=>setShowCreateGroup(true)} className="transition-all hover:scale-125" style={{ color:'rgba(150,180,255,0.5)' }}><Plus size={13}/></button>
           </div>
-          {groups.map(g => (
+          {/* Group search bar */}
+          {groups.length > 0 && (
+            <div style={{ position:'relative', marginBottom:6 }}>
+              <input
+                value={groupSearch}
+                onChange={e => setGroupSearch(e.target.value)}
+                placeholder="Search groups..."
+                style={{ width:'100%', padding:'6px 10px 6px 28px', borderRadius:8, fontSize:12, background:'rgba(255,255,255,0.05)', border:'1px solid rgba(74,144,226,0.2)', color:'white', outline:'none', boxSizing:'border-box', fontFamily:'inherit' }}
+                onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.5)';}}
+                onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.2)';}}
+              />
+              <span style={{ position:'absolute', left:9, top:'50%', transform:'translateY(-50%)', fontSize:12, pointerEvents:'none', color:'rgba(150,180,255,0.4)' }}>🔍</span>
+              {groupSearch && (
+                <button onClick={()=>setGroupSearch('')}
+                  style={{ position:'absolute', right:6, top:'50%', transform:'translateY(-50%)', background:'none', border:'none', color:'rgba(150,180,255,0.5)', cursor:'pointer', fontSize:13 }}>✕</button>
+              )}
+            </div>
+          )}
+          {groups.filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase())).map(g => (
             <button key={g.id} onClick={()=>switchGroup(g)}
               className={`sidebar-item w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm mb-0.5 ${activeGroup?.id===g.id?'active':''}`}
               style={{ color: activeGroup?.id===g.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeGroup?.id===g.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
@@ -962,6 +1181,9 @@ export default function Chat() {
               {g.admin_id===user.id && <span className="ml-auto text-xs" style={{ color:'#f59e0b' }}>★</span>}
             </button>
           ))}
+          {groups.length > 0 && groupSearch && groups.filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase())).length === 0 && (
+            <p style={{ fontSize:11, color:'rgba(150,180,255,0.4)', textAlign:'center', padding:'8px 0' }}>No groups found</p>
+          )}
         </div>
 
         {/* DMs */}
@@ -1131,10 +1353,16 @@ export default function Chat() {
           ) : (
             <div className="p-3">
               <div className="chat-input-box relative flex items-end gap-2 p-2 rounded-2xl">
-                <button onClick={()=>fileInputRef.current?.click()} className="p-2 rounded-xl transition-all hover:scale-110 flex-shrink-0" style={{ color:'rgba(150,180,255,0.6)' }}>
+                <button onClick={()=>fileInputRef.current?.click()} className="p-2 rounded-xl transition-all hover:scale-110 flex-shrink-0" title="Send Image" style={{ color:'rgba(150,180,255,0.6)' }}>
                   <Paperclip size={17}/>
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*" style={{ display:'none' }} onChange={handleImageUpload}/>
+                <button onClick={()=>fileShareInputRef.current?.click()} className="p-2 rounded-xl transition-all hover:scale-110 flex-shrink-0" title="Share File" style={{ color:'rgba(150,180,255,0.6)' }}>
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="12" y2="12"/><line x1="15" y1="15" x2="12" y2="12"/>
+                  </svg>
+                </button>
+                <input ref={fileShareInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.txt,.csv,.mp3,.mp4,.json" style={{ display:'none' }} onChange={handleFileShare}/>
                 <textarea value={input} onChange={handleTyping}
                   onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();} }}
                   placeholder={`Message ${getChatTitle()}...`} rows={1}
@@ -1254,7 +1482,7 @@ export default function Chat() {
               {[
                 { icon:<Reply size={13}/>, label:'Reply', action:()=>{setReplyTo(contextMenu.msg);setContextMenu(null);} },
                 { icon:<Forward size={13}/>, label:'Forward', action:()=>{setForwardMsg(contextMenu.msg);setContextMenu(null);} },
-                ...(Number(contextMenu.msg.user_id)===Number(user.id)||Number(contextMenu.msg.from_user_id)===Number(user.id) ? [
+                ...((Number(contextMenu.msg.user_id)===Number(user.id)) || (Number(contextMenu.msg.from_user_id)===Number(user.id)) || (contextMenu.msg.user_id===user.id) || (contextMenu.msg.from_user_id===user.id) || (String(contextMenu.msg.user_id)===String(user.id)) || (String(contextMenu.msg.from_user_id)===String(user.id)) ? [
                   ...(!contextMenu.msg.text?.includes('[IMAGE]') ? [{ icon:<Edit2 size={13}/>, label:'Edit', action:()=>{setEditingMsg({...contextMenu.msg,type:activeDM?'private':activeGroup?'group':'channel'});setEditText(contextMenu.msg.text);setContextMenu(null);} }] : []),
                   { icon:<Trash2 size={13}/>, label:'Delete', action:()=>handleDeleteMessage(contextMenu.msg), red:true },
                 ] : []),
@@ -1375,10 +1603,59 @@ export default function Chat() {
             {activeGroup.admin_id===user.id && (
               <div className="mb-4">
                 <p className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color:'rgba(150,180,255,0.5)' }}>Add Member</p>
-                <div className="flex gap-2">
-                  <input value={addMemberInput} onChange={e=>setAddMemberInput(e.target.value)} placeholder="Username..." style={{ ...inputSt, flex:1 }}
-                    onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)';}} onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)';}}/>
-                  <button onClick={handleAddMember} style={{ padding:'0 16px', borderRadius:10, background:'rgba(34,197,94,0.2)', border:'1px solid rgba(34,197,94,0.3)', color:'#22c55e', fontWeight:700, cursor:'pointer', fontFamily:'inherit' }}>Add</button>
+                <div style={{ position:'relative' }}>
+                  <div style={{ display:'flex', gap:8 }}>
+                    <div style={{ flex:1, position:'relative' }}>
+                      <input
+                        value={addMemberSearch}
+                        onChange={e => { setAddMemberSearch(e.target.value); setShowAddMemberDropdown(true); }}
+                        onFocus={() => setShowAddMemberDropdown(true)}
+                        placeholder="Search by username or User ID..."
+                        style={{ ...inputSt, paddingLeft:36 }}
+                        onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.7)'; setShowAddMemberDropdown(true);}}
+                        onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.25)'; setTimeout(()=>setShowAddMemberDropdown(false), 200);}}
+                      />
+                      <span style={{ position:'absolute', left:12, top:'50%', transform:'translateY(-50%)', fontSize:14, pointerEvents:'none' }}>🔍</span>
+                    </div>
+                  </div>
+                  {/* Search dropdown */}
+                  {showAddMemberDropdown && addMemberSearch && (
+                    <div style={{ position:'absolute', top:'100%', left:0, right:0, zIndex:100, borderRadius:10, border:'1px solid rgba(74,144,226,0.3)', background:'rgba(3,8,28,0.98)', boxShadow:'0 8px 30px rgba(0,0,0,0.5)', maxHeight:200, overflowY:'auto', marginTop:4 }}>
+                      {users
+                        .filter(u => {
+                          // Exclude already added members
+                          const alreadyMember = groupMembersList.find(m => m.id === u.id);
+                          if (alreadyMember) return false;
+                          const q = addMemberSearch.toLowerCase();
+                          return u.username.toLowerCase().includes(q) ||
+                            (u.user_code && u.user_code.toLowerCase().includes(q)) ||
+                            String(u.id).includes(q);
+                        })
+                        .map(u => (
+                          <div key={u.id}
+                            onMouseDown={() => handleAddMember(u)}
+                            style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 14px', cursor:'pointer', borderBottom:'1px solid rgba(74,144,226,0.1)', transition:'background 0.15s' }}
+                            onMouseEnter={e=>e.currentTarget.style.background='rgba(74,144,226,0.12)'}
+                            onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                            <Avatar user={u} size={28} />
+                            <div>
+                              <p style={{ fontSize:13, fontWeight:600, color:'white', margin:0 }}>{u.username}</p>
+                              <p style={{ fontSize:11, fontFamily:'monospace', color:'rgba(100,140,255,0.6)', margin:0 }}>{u.user_code || formatUID(u.id)}</p>
+                            </div>
+                            <span style={{ marginLeft:'auto', fontSize:11, color:'#22c55e', fontWeight:600 }}>+ Add</span>
+                          </div>
+                        ))
+                      }
+                      {users.filter(u => {
+                        const alreadyMember = groupMembersList.find(m => m.id === u.id);
+                        if (alreadyMember) return false;
+                        const q = addMemberSearch.toLowerCase();
+                        return u.username.toLowerCase().includes(q) || (u.user_code && u.user_code.toLowerCase().includes(q)) || String(u.id).includes(q);
+                      }).length === 0 && (
+                        <p style={{ textAlign:'center', color:'rgba(150,180,255,0.4)', fontSize:13, padding:16 }}>No users found</p>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1403,9 +1680,13 @@ export default function Chat() {
                 </div>
               ))}
             </div>
-            {activeGroup.admin_id!==user.id && (
+            {activeGroup.admin_id!==user.id ? (
               <button onClick={handleLeaveGroup} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102" style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}>
                 <LogOut size={14}/> Leave Group
+              </button>
+            ) : (
+              <button onClick={()=>{ setShowAdminPanel(false); handleDeleteGroup(activeGroup.id); }} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102" style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}>
+                <Trash2 size={14}/> Delete Group
               </button>
             )}
             <button onClick={()=>{setShowAdminPanel(false);setAdminError('');}} className="w-full py-2.5 rounded-xl text-sm transition-all" style={{ background:'rgba(255,255,255,0.05)', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.6)' }}>Close</button>
