@@ -109,12 +109,33 @@ router.get('/:id/messages', auth, (req, res) => {
 router.post('/:id/messages', auth, (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ message: 'Text required' });
+  const ts = Date.now();
+  const groupId = req.params.id;
   req.db.query(
     'INSERT INTO group_messages (group_id, user_id, text) VALUES (?,?,?)',
-    [req.params.id, req.user.id, text],
+    [groupId, req.user.id, text],
     (err, result) => {
       if (err) return res.status(500).json({ message: 'Database error' });
-      res.status(201).json({ id: result.insertId, group_id: req.params.id, user_id: req.user.id, text, username: req.user.username, created_at: new Date(), edited: 0, deleted: 0 });
+
+      // Save unread for all OTHER group members in DB (persists when offline)
+      req.db.query(
+        'SELECT user_id FROM group_members WHERE group_id=? AND user_id!=?',
+        [groupId, req.user.id],
+        (err2, members) => {
+          console.log(`👥 Saving group unread for ${members.length} members in group: ${groupId}`);
+          if (!err2 && members.length) {
+            const values = members.map(m => [m.user_id, 'group', String(groupId), 1, ts]);
+            req.db.query(
+              `INSERT INTO unread_counts (user_id, ref_type, ref_id, count, last_message_time)
+               VALUES ? ON DUPLICATE KEY UPDATE count=count+1, last_message_time=?`,
+              [values, ts],
+              (err3) => { console.log('Group unread saved:', err3 ? err3.message : 'OK'); }
+            );
+          }
+        }
+      );
+
+      res.status(201).json({ id: result.insertId, group_id: groupId, user_id: req.user.id, text, username: req.user.username, created_at: new Date(), edited: 0, deleted: 0 });
     }
   );
 });

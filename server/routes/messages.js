@@ -94,6 +94,19 @@ router.post('/upload-file', auth, (req, res) => {
   });
 });
 
+// ── GET UNREAD COUNTS (must be before /:room) ──
+router.get('/unread-counts', auth, (req, res) => {
+  req.db.query(
+    'SELECT ref_type, ref_id, count, last_message_time FROM unread_counts WHERE user_id=?',
+    [req.user.id],
+    (err, rows) => {
+      if (err) { console.error('unread-counts error:', err.message); return res.json([]); }
+      console.log(`📊 Returning ${rows.length} unread records for user ${req.user.id}`);
+      res.json(rows);
+    }
+  );
+});
+
 // ── GET CHANNEL MESSAGES ──
 router.get('/:room', auth, (req, res) => {
   if (req.params.room === 'private') return res.status(400).json({ message: 'Use /private/:userId' });
@@ -111,8 +124,21 @@ router.get('/:room', auth, (req, res) => {
 router.post('/', auth, (req, res) => {
   const { room, text } = req.body;
   if (!room || !text) return res.status(400).json({ message: 'Room and text required' });
+  const ts = Date.now();
   req.db.query('INSERT INTO messages (user_id,room,text) VALUES (?,?,?)', [req.user.id, room, text], (err, result) => {
     if (err) { console.error('DB error:', err.message); return res.status(500).json({ message: 'Database error: ' + err.message }); }
+    // Save unread for ALL other users
+    req.db.query('SELECT id FROM users WHERE id!=?', [req.user.id], (e, users) => {
+      if (e) { console.error('Channel unread users error:', e.message); return; }
+      console.log(`📢 Saving channel unread for ${users.length} users in room: ${room}`);
+      if (users.length) {
+        const vals = users.map(u => [u.id, 'channel', room, 1, ts]);
+        req.db.query(
+          `INSERT INTO unread_counts (user_id,ref_type,ref_id,count,last_message_time) VALUES ? ON DUPLICATE KEY UPDATE count=count+1,last_message_time=?`,
+          [vals, ts], (e2) => { console.log('Channel unread saved:', e2 ? e2.message : 'OK'); }
+        );
+      }
+    });
     res.status(201).json({ id:result.insertId, user_id:req.user.id, room, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0 });
   });
 });
@@ -150,9 +176,25 @@ router.get('/private/:userId', auth, (req, res) => {
 router.post('/private', auth, (req, res) => {
   const { to_user_id, text } = req.body;
   if (!to_user_id || !text) return res.status(400).json({ message: 'Required fields missing' });
-  req.db.query('INSERT INTO private_messages (from_user_id,to_user_id,text) VALUES (?,?,?)', [req.user.id, to_user_id, text], (err, result) => {
+  const ts = Date.now();
+  const toId = parseInt(to_user_id);
+  const fromId = parseInt(req.user.id);
+  console.log(`💬 DM from ${fromId} to ${toId}`);
+  req.db.query('INSERT INTO private_messages (from_user_id,to_user_id,text) VALUES (?,?,?)', [fromId, toId, text], (err, result) => {
     if (err) { console.error('DB error:', err.message); return res.status(500).json({ message: 'Database error: ' + err.message }); }
-    res.status(201).json({ id:result.insertId, from_user_id:req.user.id, to_user_id, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0 });
+    // Save unread for RECEIVER (count+1)
+    req.db.query(
+      `INSERT INTO unread_counts (user_id,ref_type,ref_id,count,last_message_time) VALUES (?,?,?,1,?) ON DUPLICATE KEY UPDATE count=count+1,last_message_time=?`,
+      [toId, 'dm', String(fromId), ts, ts],
+      (err2) => { console.log(`📬 Receiver unread saved for user ${toId}:`, err2 ? err2.message : 'OK'); }
+    );
+    // Update time for SENDER (ordering, count=0)
+    req.db.query(
+      `INSERT INTO unread_counts (user_id,ref_type,ref_id,count,last_message_time) VALUES (?,?,?,0,?) ON DUPLICATE KEY UPDATE last_message_time=?`,
+      [fromId, 'dm', String(toId), ts, ts],
+      (err3) => { console.log(`📬 Sender time saved for user ${fromId}:`, err3 ? err3.message : 'OK'); }
+    );
+    res.status(201).json({ id:result.insertId, from_user_id:fromId, to_user_id:toId, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0 });
   });
 });
 
@@ -180,17 +222,7 @@ router.put('/private/:id/seen', auth, (req, res) => {
   });
 });
 
-// ── GET UNREAD COUNTS ──
-router.get('/unread-counts', auth, (req, res) => {
-  req.db.query(
-    'SELECT ref_type, ref_id, count, last_message_time FROM unread_counts WHERE user_id=?',
-    [req.user.id],
-    (err, rows) => {
-      if (err) return res.json([]); // Return empty if table doesn't exist yet
-      res.json(rows);
-    }
-  );
-});
+
 
 // ── INCREMENT UNREAD COUNT (receiver only) ──
 router.post('/unread-increment', auth, (req, res) => {

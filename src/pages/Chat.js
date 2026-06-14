@@ -421,8 +421,10 @@ export default function Chat() {
     socket.on('missedCallMessage', async ({ fromUser }) => {
       try { const r = await axios.post(`${API}/messages/private`, { to_user_id:fromUser.id, text:'📞 Missed voice call' }); setMessages(prev => [...prev, { ...r.data, username:user.username, avatar_color:user.avatar_color }]); } catch {}
     });
-    loadUsers(); loadGroups(); loadMessages('channel','announcements');
+    loadUsers(); loadGroups(); loadMessages('channel', 'announcements', false);
     loadUnreadCounts();
+    // Also reload unread counts after a short delay to ensure DB is ready
+    setTimeout(() => loadUnreadCounts(), 1500);
     // Join ALL channel rooms so we receive notifications from all channels
     ['announcements', 'tech-updates', 'job-notifications'].forEach(ch => {
       socket.emit('joinRoom', ch);
@@ -493,6 +495,7 @@ export default function Chat() {
   const loadUnreadCounts = async () => {
     try {
       const r = await axios.get(`${API}/messages/unread-counts`);
+      console.log('📊 Unread counts from DB:', r.data);
       const counts = {};
       const times = {};
       r.data.forEach(item => {
@@ -500,9 +503,12 @@ export default function Chat() {
         if (item.count > 0) counts[key] = item.count;
         if (item.last_message_time > 0) times[key] = Number(item.last_message_time);
       });
+      console.log('📊 Processed counts:', counts);
       setUnreadCounts(counts);
       setLastMessageTimes(prev => ({ ...prev, ...times }));
-    } catch {}
+    } catch(err) {
+      console.error('loadUnreadCounts error:', err.message);
+    }
   };
 
   const loadAdminUsers = async () => {
@@ -562,24 +568,23 @@ export default function Chat() {
     } catch {}
   };
 
-  const loadMessages = async (type, id) => {
+  const loadMessages = async (type, id, shouldClearUnread = false) => {
     try {
       setMessages([]);
       let r;
       if (type==='channel') {
         r = await axios.get(`${API}/messages/${id}`);
         socket.emit('joinRoom', id);
-        clearUnread(`channel_${id}`);
+        if (shouldClearUnread) clearUnread(`channel_${id}`);
       }
       else if (type==='dm') {
         r = await axios.get(`${API}/messages/private/${id}`);
-        clearUnread(`dm_${id}`);
+        if (shouldClearUnread) clearUnread(`dm_${id}`);
       }
       else {
         r = await axios.get(`${API}/groups/${id}/messages`);
-        // Join this group room (stay in all other rooms for notifications)
         socket.emit('joinGroup', id);
-        clearUnread(`group_${id}`);
+        if (shouldClearUnread) clearUnread(`group_${id}`);
       }
       setMessages(r.data);
     } catch {}
@@ -587,20 +592,25 @@ export default function Chat() {
 
   const switchChannel = async ch => {
     setTypingUsers([]);
-    setActiveChannel(ch); setActiveDM(null); setActiveGroup(null); loadMessages('channel',ch);
     clearUnread(`channel_${ch}`);
+    setActiveChannel(ch); setActiveDM(null); setActiveGroup(null); loadMessages('channel', ch, true);
     if (user.role === 'admin') { setCanPost(true); return; }
     try {
       const r = await axios.get(`${API}/admin/can-post/${ch}`);
       setCanPost(r.data.canPost);
     } catch { setCanPost(true); }
   };
-  const switchDM = u => { setActiveDM(u); setActiveChannel(null); setActiveGroup(null); loadMessages('dm',u.id); };
+  const switchDM = u => {
+    setLastMessageTimes(prev => ({ ...prev, [`dm_${u.id}`]: Date.now() }));
+    clearUnread(`dm_${u.id}`);
+    setTypingUsers([]);
+    setActiveDM(u); setActiveChannel(null); setActiveGroup(null); loadMessages('dm', u.id, true);
+  };
   const switchGroup = async g => {
     setLastMessageTimes(prev => ({ ...prev, [`group_${g.id}`]: Date.now() }));
     clearUnread(`group_${g.id}`);
-    setTypingUsers([]); // Clear typing when switching
-    setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group',g.id);
+    setTypingUsers([]);
+    setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group', g.id, true);
     try {
       const membersRes = await axios.get(`${API}/groups/${g.id}/members`);
       setGroupMembersList(membersRes.data);
