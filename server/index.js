@@ -45,6 +45,12 @@ io.on('connection', (socket) => {
 
   socket.on('joinRoom', (room) => socket.join(room));
   socket.on('joinGroup', (groupId) => socket.join(`group_${groupId}`));
+  socket.on('leaveAllGroups', () => {
+    // Leave all group rooms
+    socket.rooms.forEach(room => {
+      if (room.startsWith('group_')) socket.leave(room);
+    });
+  });
 
   socket.on('sendMessage', (msg) => {
     io.to(msg.room).emit('newMessage', msg);
@@ -61,7 +67,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('typing', ({ room, username, isTyping }) => {
-    socket.to(room).emit('userTyping', { username, isTyping });
+    socket.to(room).emit('userTyping', { username, isTyping, room });
   });
 
   socket.on('addReaction', (data) => {
@@ -70,6 +76,16 @@ io.on('connection', (socket) => {
 
   socket.on('editMessage', (data) => io.emit('messageEdited', data));
   // Group events - only notify members, not everyone
+  // Role updated - notify the specific user instantly
+  socket.on('roleUpdated', ({ userId, role }) => {
+    // Find the user's socket and emit to them
+    const target = Object.values(onlineUsers).find(u => Number(u.id) === Number(userId));
+    if (target) {
+      io.to(target.socketId).emit('roleUpdated', { userId, role });
+      console.log(`✅ Role updated for user ${userId} to ${role}`);
+    }
+  });
+
   socket.on('groupCreated', ({ group, memberUsernames }) => {
     // Notify only online users who are members
     Object.values(onlineUsers).forEach(u => {

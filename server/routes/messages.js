@@ -180,4 +180,63 @@ router.put('/private/:id/seen', auth, (req, res) => {
   });
 });
 
+// ── GET UNREAD COUNTS ──
+router.get('/unread-counts', auth, (req, res) => {
+  req.db.query(
+    'SELECT ref_type, ref_id, count, last_message_time FROM unread_counts WHERE user_id=?',
+    [req.user.id],
+    (err, rows) => {
+      if (err) return res.json([]); // Return empty if table doesn't exist yet
+      res.json(rows);
+    }
+  );
+});
+
+// ── INCREMENT UNREAD COUNT (receiver only) ──
+router.post('/unread-increment', auth, (req, res) => {
+  const { ref_type, ref_id, last_message_time, sender_id } = req.body;
+  // Never add unread for the sender
+  if (sender_id && Number(sender_id) === Number(req.user.id)) {
+    return res.json({ message: 'Skipped - sender' });
+  }
+  req.db.query(
+    `INSERT INTO unread_counts (user_id, ref_type, ref_id, count, last_message_time)
+     VALUES (?,?,?,1,?)
+     ON DUPLICATE KEY UPDATE count=count+1, last_message_time=?`,
+    [req.user.id, ref_type, ref_id, last_message_time, last_message_time],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Database error' });
+      res.json({ message: 'Updated' });
+    }
+  );
+});
+
+// ── UPDATE LAST MESSAGE TIME (for ordering, without incrementing count) ──
+router.post('/unread-update-time', auth, (req, res) => {
+  const { ref_type, ref_id, last_message_time } = req.body;
+  req.db.query(
+    `INSERT INTO unread_counts (user_id, ref_type, ref_id, count, last_message_time)
+     VALUES (?,?,?,0,?)
+     ON DUPLICATE KEY UPDATE last_message_time=?`,
+    [req.user.id, ref_type, ref_id, last_message_time, last_message_time],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Database error' });
+      res.json({ message: 'Updated' });
+    }
+  );
+});
+
+// ── CLEAR UNREAD COUNT ──
+router.post('/unread-clear', auth, (req, res) => {
+  const { ref_type, ref_id } = req.body;
+  req.db.query(
+    'UPDATE unread_counts SET count=0 WHERE user_id=? AND ref_type=? AND ref_id=?',
+    [req.user.id, ref_type, ref_id],
+    (err) => {
+      if (err) return res.status(500).json({ message: 'Database error' });
+      res.json({ message: 'Cleared' });
+    }
+  );
+});
+
 module.exports = router;

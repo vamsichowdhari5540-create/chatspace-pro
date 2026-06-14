@@ -218,6 +218,8 @@ export default function Chat() {
   const [groupError, setGroupError] = useState('');
   const [groupMemberSearch, setGroupMemberSearch] = useState('');
   const [groupSearch, setGroupSearch] = useState('');
+  const [dmSearch, setDmSearch] = useState('');
+  const [showMoreGroups, setShowMoreGroups] = useState(false);
   const [selectedGroupMembers, setSelectedGroupMembers] = useState([]);
   const [contextMenu, setContextMenu] = useState(null);
   const [groupMembersList, setGroupMembersList] = useState([]);
@@ -247,7 +249,8 @@ export default function Chat() {
   const [selectedUser, setSelectedUser] = useState(null);
   const [userPermissions, setUserPermissions] = useState([]);
   const [adminSearch, setAdminSearch] = useState('');
-  const [unreadCounts, setUnreadCounts] = useState({}); // { 'channel_announcements': 3, 'dm_2': 5, 'group_1': 2 }
+  const [unreadCounts, setUnreadCounts] = useState({});
+  const [lastMessageTimes, setLastMessageTimes] = useState({});
   const [imageViewer, setImageViewer] = useState(null); // { src, zoom }
 
   const messagesEndRef = useRef(null);
@@ -260,6 +263,13 @@ export default function Chat() {
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
+  // Refs to track current state inside socket listeners (avoid stale closures)
+  const activeChannelRef = useRef(activeChannel);
+  const activeDMRef = useRef(activeDM);
+  const activeGroupRef = useRef(activeGroup);
+  const userIdRef = useRef(user?.id);
+  const unreadCountsRef = useRef({});
+  const lastMessageTimesRef = useRef({});
   const rtcConfig = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -314,27 +324,79 @@ export default function Chat() {
     socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
     socket.on('onlineUsers', setOnlineUsers);
     socket.on('groupCreated', () => loadGroups());
+    // Role updated by admin - update permissions instantly
+    socket.on('roleUpdated', ({ userId, role }) => {
+      if (Number(userId) === Number(user.id)) {
+        // Update user role in context
+        setUser(prev => ({ ...prev, role }));
+        // Re-check channel permissions immediately
+        if (activeChannelRef.current) {
+          axios.get(`${API}/admin/can-post/${activeChannelRef.current}`)
+            .then(r => setCanPost(r.data.canPost))
+            .catch(() => {});
+        }
+        // Show notification
+        addToast({ 
+          title: '🔄 Role Updated!', 
+          message: `Your role has been changed to ${role}` 
+        });
+      }
+    });
     socket.on('groupDeleted', ({ groupId }) => {
       setGroups(prev => prev.filter(g => g.id !== groupId));
       if (activeGroup?.id === groupId) { setActiveGroup(null); setMessages([]); }
     });
     socket.on('newMessage', msg => {
-      // Add unread if not currently viewing this channel
-      if (msg.room !== activeChannel) addUnread(`channel_${msg.room}`);
-      setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
-      if (msg.user_id!==user.id) { addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} }); showPushNotif(msg.username, msg.text?.substring(0,60)||'📷'); }
+      const ts = Date.now();
+      const isSender = Number(msg.user_id) === Number(userIdRef.current);
+      const isViewing = msg.room === activeChannelRef.current;
+      setLastMessageTimes(prev => ({ ...prev, [`channel_${msg.room}`]: ts }));
+      if (!isViewing) addUnread(`channel_${msg.room}`, ts, msg.user_id);
+      if (isViewing) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+      if (!isSender) {
+        addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} });
+        showPushNotif(msg.username, msg.text?.substring(0,60)||'📷');
+      }
     });
+
     socket.on('newPrivateMessage', msg => {
-      // Add unread if not currently viewing this DM
-      const dmId = msg.from_user_id === user.id ? msg.to_user_id : msg.from_user_id;
-      if (!activeDM || activeDM.id !== dmId) addUnread(`dm_${dmId}`);
-      setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
-      if (msg.from_user_id!==user.id) { addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} }); showPushNotif(msg.username, msg.text?.substring(0,60)||'📷'); }
+      const ts = Date.now();
+      const isSender = Number(msg.from_user_id) === Number(userIdRef.current);
+      const dmId = isSender ? msg.to_user_id : msg.from_user_id;
+      const isViewing = activeDMRef.current && Number(activeDMRef.current.id) === Number(dmId);
+      console.log('🔔 newPrivateMessage:', 'isSender:', isSender, 'dmId:', dmId, 'isViewing:', isViewing, 'userIdRef:', userIdRef.current);
+      setLastMessageTimes(prev => ({ ...prev, [`dm_${dmId}`]: ts }));
+      if (!isSender && !isViewing) {
+        console.log('✅ Adding unread for DM:', dmId);
+        addUnread(`dm_${dmId}`, ts, msg.from_user_id);
+      }
+      if (isViewing || isSender) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+      if (!isSender) {
+        addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} });
+        showPushNotif(msg.username, msg.text?.substring(0,60)||'📷');
+      }
     });
+
     socket.on('newGroupMessage', msg => {
-      // Add unread if not currently viewing this group
-      if (!activeGroup || activeGroup.id !== msg.group_id) addUnread(`group_${msg.group_id}`); setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]); });
-    socket.on('userTyping', ({ username, isTyping }) => { setTypingUsers(prev => isTyping ? [...prev.filter(u=>u!==username),username] : prev.filter(u=>u!==username)); });
+      const ts = Date.now();
+      const isSender = Number(msg.user_id) === Number(userIdRef.current);
+      const isViewing = activeGroupRef.current && Number(activeGroupRef.current.id) === Number(msg.group_id);
+      console.log('🔔 newGroupMessage:', msg.group_id, 'isSender:', isSender, 'isViewing:', isViewing, 'userIdRef:', userIdRef.current, 'msg.user_id:', msg.user_id);
+      setLastMessageTimes(prev => ({ ...prev, [`group_${msg.group_id}`]: ts }));
+      if (!isSender && !isViewing) {
+        console.log('✅ Adding unread for group:', msg.group_id);
+        addUnread(`group_${msg.group_id}`, ts, msg.user_id);
+      }
+      if (isViewing) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+    });
+    socket.on('userTyping', ({ username, isTyping, room }) => {
+      // Only show typing if:
+      // 1. We are in the same channel
+      // 2. Not in a DM or group (channel typing shouldn't show in DMs/groups)
+      if (!activeChannel) return; // We're in DM or group, don't show channel typing
+      if (room !== activeChannel) return; // Different channel
+      setTypingUsers(prev => isTyping ? [...prev.filter(u=>u!==username),username] : prev.filter(u=>u!==username));
+    });
     socket.on('messageReaction', ({ messageId, reactions:r }) => { setReactions(prev => ({...prev,[messageId]:r})); });
     socket.on('messageEdited', ({ id, text }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text,edited:1}:m)); });
     socket.on('messageDeleted', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text:'This message was deleted',deleted:1}:m)); });
@@ -351,6 +413,7 @@ export default function Chat() {
       try { const r = await axios.post(`${API}/messages/private`, { to_user_id:fromUser.id, text:'📞 Missed voice call' }); setMessages(prev => [...prev, { ...r.data, username:user.username, avatar_color:user.avatar_color }]); } catch {}
     });
     loadUsers(); loadGroups(); loadMessages('channel','announcements');
+    loadUnreadCounts();
     // Check if user can post in default channel
     if (user.role !== 'admin') {
       axios.get(`${API}/admin/can-post/announcements`).then(r => setCanPost(r.data.canPost)).catch(() => {});
@@ -363,6 +426,12 @@ export default function Chat() {
   }, []);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages]);
+  useEffect(() => { activeChannelRef.current = activeChannel; }, [activeChannel]);
+  useEffect(() => { activeDMRef.current = activeDM; }, [activeDM]);
+  useEffect(() => { activeGroupRef.current = activeGroup; }, [activeGroup]);
+  useEffect(() => { userIdRef.current = user?.id; }, [user]);
+  useEffect(() => { unreadCountsRef.current = unreadCounts; }, [unreadCounts]);
+  useEffect(() => { lastMessageTimesRef.current = lastMessageTimes; }, [lastMessageTimes]);
 
   useEffect(() => {
     if (activeDM) {
@@ -376,12 +445,42 @@ export default function Chat() {
   const loadGroups = async () => { try { const r = await axios.get(`${API}/groups`); setGroups(r.data); } catch {} };
   const loadBlockedUsers = async () => { try { const r = await axios.get(`${API}/users/blocked`); setBlockedUsers(r.data); } catch {} };
 
-  const addUnread = (key) => {
+  const addUnread = useCallback((key, timestamp, senderId) => {
+    // Never add unread badge for the sender
+    if (senderId && Number(senderId) === Number(userIdRef.current)) {
+      // Still update time for ordering
+      if (timestamp) setLastMessageTimes(prev => ({ ...prev, [key]: timestamp }));
+      const [type, ...rest] = key.split('_');
+      axios.post(`${API}/messages/unread-update-time`, { ref_type: type, ref_id: rest.join('_'), last_message_time: timestamp }).catch(() => {});
+      return;
+    }
     setUnreadCounts(prev => ({ ...prev, [key]: (prev[key] || 0) + 1 }));
-  };
+    if (timestamp) setLastMessageTimes(prev => ({ ...prev, [key]: timestamp }));
+    const [type, ...rest] = key.split('_');
+    const refId = rest.join('_');
+    axios.post(`${API}/messages/unread-increment`, { ref_type: type, ref_id: refId, last_message_time: timestamp || Date.now() }).catch(() => {});
+  }, []);
 
-  const clearUnread = (key) => {
+  const clearUnread = useCallback((key) => {
     setUnreadCounts(prev => ({ ...prev, [key]: 0 }));
+    const [type, ...rest] = key.split('_');
+    const refId = rest.join('_');
+    axios.post(`${API}/messages/unread-clear`, { ref_type: type, ref_id: refId }).catch(() => {});
+  }, []);
+
+  const loadUnreadCounts = async () => {
+    try {
+      const r = await axios.get(`${API}/messages/unread-counts`);
+      const counts = {};
+      const times = {};
+      r.data.forEach(item => {
+        const key = `${item.ref_type}_${item.ref_id}`;
+        if (item.count > 0) counts[key] = item.count;
+        if (item.last_message_time > 0) times[key] = Number(item.last_message_time);
+      });
+      setUnreadCounts(counts);
+      setLastMessageTimes(prev => ({ ...prev, ...times }));
+    } catch {}
   };
 
   const loadAdminUsers = async () => {
@@ -420,6 +519,8 @@ export default function Chat() {
       await axios.put(`${API}/admin/users/${userId}/role`, { role });
       loadAdminUsers();
       addToast({ title:'Role updated!', message:`User role set to ${role}` });
+      // Notify the user instantly via socket - no refresh needed!
+      if (socket) socket.emit('roleUpdated', { userId: Number(userId), role });
     } catch(err) { addToast({ title:'Error', message: err.response?.data?.message || 'Failed' }); }
   };
 
@@ -443,14 +544,28 @@ export default function Chat() {
     try {
       setMessages([]);
       let r;
-      if (type==='channel') { r = await axios.get(`${API}/messages/${id}`); socket.emit('joinRoom',id); }
-      else if (type==='dm') { r = await axios.get(`${API}/messages/private/${id}`); }
-      else { r = await axios.get(`${API}/groups/${id}/messages`); socket.emit('joinGroup',id); }
+      if (type==='channel') {
+        r = await axios.get(`${API}/messages/${id}`);
+        socket.emit('joinRoom', id);
+        clearUnread(`channel_${id}`);
+      }
+      else if (type==='dm') {
+        r = await axios.get(`${API}/messages/private/${id}`);
+        clearUnread(`dm_${id}`);
+      }
+      else {
+        r = await axios.get(`${API}/groups/${id}/messages`);
+        // Leave all other group rooms first
+        socket.emit('leaveAllGroups');
+        socket.emit('joinGroup', id);
+        clearUnread(`group_${id}`);
+      }
       setMessages(r.data);
     } catch {}
   };
 
   const switchChannel = async ch => {
+    setTypingUsers([]);
     setActiveChannel(ch); setActiveDM(null); setActiveGroup(null); loadMessages('channel',ch);
     clearUnread(`channel_${ch}`);
     if (user.role === 'admin') { setCanPost(true); return; }
@@ -461,8 +576,10 @@ export default function Chat() {
   };
   const switchDM = u => { setActiveDM(u); setActiveChannel(null); setActiveGroup(null); loadMessages('dm',u.id); };
   const switchGroup = async g => {
-    setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group',g.id);
+    setLastMessageTimes(prev => ({ ...prev, [`group_${g.id}`]: Date.now() }));
     clearUnread(`group_${g.id}`);
+    setTypingUsers([]); // Clear typing when switching
+    setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group',g.id);
     try {
       const membersRes = await axios.get(`${API}/groups/${g.id}/members`);
       setGroupMembersList(membersRes.data);
@@ -486,10 +603,15 @@ export default function Chat() {
 
   const handleTyping = e => {
     setInput(e.target.value);
+    // Only emit typing for channels, not DMs or groups (to avoid cross-chat bug)
     if (activeChannel) {
       socket.emit('typing', { room:activeChannel, username:user.username, isTyping:true });
       clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = setTimeout(() => socket.emit('typing', { room:activeChannel, username:user.username, isTyping:false }), 1500);
+    }
+    // Clear typing when switching to DM or group
+    if (activeDM || activeGroup) {
+      setTypingUsers([]);
     }
   };
 
@@ -1135,25 +1257,38 @@ export default function Chat() {
         </div>
 
         {/* Channels */}
-        <div className="px-2 pt-3">
-          <p className="text-xs font-bold px-2 mb-1 uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Channels</p>
+        <div className="px-2 pt-2">
+          <p style={{ fontSize:10, fontWeight:700, color:'rgba(150,180,255,0.45)', textTransform:'uppercase', letterSpacing:'0.12em', padding:'0 8px', marginBottom:4 }}>Channels</p>
           {CHANNELS.map(ch => {
-            const labels = { 'announcements': '📢 Announcements', 'tech-updates': '💻 Tech Updates', 'job-notifications': '💼 Job Notifications' };
+            const meta = {
+              'announcements':     { icon:'📢', label:'Announcements' },
+              'tech-updates':      { icon:'💻', label:'Tech Updates' },
+              'job-notifications': { icon:'💼', label:'Job Notifications' },
+            };
+            const m = meta[ch] || { icon:'#', label:ch };
             return (
               <button key={ch} onClick={()=>switchChannel(ch)}
-                className={`sidebar-item w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm mb-0.5 ${activeChannel===ch?'active':''}`}
-                style={{ color: activeChannel===ch ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeChannel===ch ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
-                <span className="truncate">{labels[ch] || ch}</span>
+                style={{
+                  width:'100%', display:'flex', alignItems:'center', gap:7,
+                  padding:'5px 8px', borderRadius:7, fontSize:12, fontWeight:500,
+                  marginBottom:2, textAlign:'left', border:'none', cursor:'pointer',
+                  fontFamily:'inherit', transition:'all 0.15s',
+                  color: activeChannel===ch ? '#4A90E2' : 'rgba(160,185,255,0.7)',
+                  background: activeChannel===ch ? 'rgba(74,144,226,0.12)' : 'transparent',
+                }}>
+                <span style={{ fontSize:13, flexShrink:0 }}>{m.icon}</span>
+                <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{m.label}</span>
+                <UnreadBadge count={unreadCounts[`channel_${ch}`]} />
               </button>
             );
           })}
         </div>
 
         {/* Groups */}
-        <div className="px-2 pt-3">
-          <div className="flex items-center justify-between px-2 mb-1">
-            <p className="text-xs font-bold uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Groups</p>
-            <button onClick={()=>setShowCreateGroup(true)} className="transition-all hover:scale-125" style={{ color:'rgba(150,180,255,0.5)' }}><Plus size={13}/></button>
+        <div className="px-2 pt-2">
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'0 8px', marginBottom:4 }}>
+            <p style={{ fontSize:10, fontWeight:700, color:'rgba(150,180,255,0.45)', textTransform:'uppercase', letterSpacing:'0.12em', margin:0 }}>Groups</p>
+            <button onClick={()=>setShowCreateGroup(true)} className="transition-all hover:scale-125" style={{ color:'rgba(150,180,255,0.5)', background:'none', border:'none', cursor:'pointer' }}><Plus size={13}/></button>
           </div>
           {/* Group search bar */}
           {groups.length > 0 && (
@@ -1173,23 +1308,61 @@ export default function Chat() {
               )}
             </div>
           )}
-          {groups.filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase())).map(g => (
-            <button key={g.id} onClick={()=>switchGroup(g)}
-              className={`sidebar-item w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm mb-0.5 ${activeGroup?.id===g.id?'active':''}`}
-              style={{ color: activeGroup?.id===g.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeGroup?.id===g.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
-              <Users size={14}/><span className="truncate">{g.name}</span>
-              {g.admin_id===user.id && <span className="ml-auto text-xs" style={{ color:'#f59e0b' }}>★</span>}
-            </button>
-          ))}
-          {groups.length > 0 && groupSearch && groups.filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase())).length === 0 && (
-            <p style={{ fontSize:11, color:'rgba(150,180,255,0.4)', textAlign:'center', padding:'8px 0' }}>No groups found</p>
-          )}
+          <div style={{ maxHeight:76, overflowY:'auto' }}>
+            {groups
+              .filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase()))
+              .sort((a,b) => {
+                const aTime = lastMessageTimes[`group_${a.id}`] || new Date(a.created_at).getTime();
+                const bTime = lastMessageTimes[`group_${b.id}`] || new Date(b.created_at).getTime();
+                return bTime - aTime;
+              })
+              .map(g => (
+                <button key={g.id} onClick={()=>{ switchGroup(g); clearUnread(`group_${g.id}`); }}
+                  className={`sidebar-item w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm mb-0.5 ${activeGroup?.id===g.id?'active':''}`}
+                  style={{ color: activeGroup?.id===g.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeGroup?.id===g.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
+                  <Users size={14} style={{ flexShrink:0 }}/>
+                  <span className="truncate flex-1">{g.name}</span>
+                  {g.admin_id===user.id && <span className="text-xs" style={{ color:'#f59e0b' }}>★</span>}
+                  <UnreadBadge count={unreadCounts[`group_${g.id}`]} />
+                </button>
+              ))
+            }
+            {groups.length > 0 && groupSearch && groups.filter(g => g.name.toLowerCase().includes(groupSearch.toLowerCase())).length === 0 && (
+              <p style={{ fontSize:11, color:'rgba(150,180,255,0.4)', textAlign:'center', padding:'8px 0' }}>No groups found</p>
+            )}
+          </div>
         </div>
 
         {/* DMs */}
-        <div className="px-2 pt-3 flex-1 overflow-y-auto">
-          <p className="text-xs font-bold px-2 mb-1 uppercase tracking-wider" style={{ color:'rgba(150,180,255,0.5)' }}>Direct Messages</p>
-          {(searchQuery ? filteredUsers : users).map(u => (
+        <div className="px-2 pt-2 flex-1 overflow-y-auto">
+          <p style={{ fontSize:10, fontWeight:700, color:'rgba(150,180,255,0.45)', textTransform:'uppercase', letterSpacing:'0.12em', padding:'0 8px', marginBottom:4 }}>Direct Messages</p>
+          {/* DM Search */}
+          <div style={{ position:'relative', marginBottom:6 }}>
+            <input
+              value={dmSearch}
+              onChange={e => setDmSearch(e.target.value)}
+              placeholder="Search users..."
+              style={{ width:'100%', padding:'5px 8px 5px 26px', borderRadius:7, fontSize:11, background:'rgba(255,255,255,0.05)', border:'1px solid rgba(74,144,226,0.2)', color:'white', outline:'none', boxSizing:'border-box', fontFamily:'inherit' }}
+              onFocus={e=>{e.target.style.borderColor='rgba(74,144,226,0.5)';}}
+              onBlur={e=>{e.target.style.borderColor='rgba(74,144,226,0.2)';}}
+            />
+            <span style={{ position:'absolute', left:8, top:'50%', transform:'translateY(-50%)', fontSize:11, color:'rgba(150,180,255,0.4)', pointerEvents:'none' }}>🔍</span>
+            {dmSearch && <button onClick={()=>setDmSearch('')} style={{ position:'absolute', right:6, top:'50%', transform:'translateY(-50%)', background:'none', border:'none', color:'rgba(150,180,255,0.5)', cursor:'pointer', fontSize:12 }}>✕</button>}
+          </div>
+          {users.filter(u => {
+            if (!dmSearch) return true;
+            const q = dmSearch.toLowerCase();
+            return u.username.toLowerCase().includes(q) ||
+              (u.user_code && u.user_code.toLowerCase().includes(q)) ||
+              String(u.id).includes(q);
+          })
+            .slice()
+            .sort((a,b) => {
+              const aTime = lastMessageTimes[`dm_${a.id}`] || a.last_message_time || 0;
+              const bTime = lastMessageTimes[`dm_${b.id}`] || b.last_message_time || 0;
+              return bTime - aTime;
+            })
+            .map(u => (
             <button key={u.id} onClick={()=>switchDM(u)}
               className={`sidebar-item w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm mb-0.5 ${activeDM?.id===u.id?'active':''}`}
               style={{ color: activeDM?.id===u.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeDM?.id===u.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
@@ -1199,6 +1372,7 @@ export default function Chat() {
                 <span className="text-xs" style={{ color:'rgba(100,140,255,0.5)' }}>{formatUID(u.id)}</span>
               </div>
               {isOnline(u.id) && <div className="w-1.5 h-1.5 rounded-full flex-shrink-0 online-dot" style={{ background: STATUS_CONFIG[u.status||'online']?.hex || '#22c55e' }} />}
+              <UnreadBadge count={unreadCounts[`dm_${u.id}`] ?? u.unread_count ?? 0} />
             </button>
           ))}
         </div>

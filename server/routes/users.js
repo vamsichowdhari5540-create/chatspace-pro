@@ -37,17 +37,37 @@ const avatarUpload = multer({
   }
 });
 
-// ── GET ALL USERS (excluding blocked) ──
+// ── GET ALL USERS sorted by last message time ──
 router.get('/', auth, (req, res) => {
+  // Try with unread_counts join first, fallback to simple query if table doesn't exist
   req.db.query(
-    `SELECT u.id, u.username, u.email, u.avatar_color, u.avatar_url, u.bio, u.status, u.last_seen, u.role, u.user_code
+    `SELECT u.id, u.username, u.email, u.avatar_color, u.avatar_url, u.bio, u.status, u.last_seen, u.role, u.user_code,
+     COALESCE(uc.last_message_time, 0) as last_message_time,
+     COALESCE(uc.count, 0) as unread_count
      FROM users u
+     LEFT JOIN unread_counts uc ON uc.user_id=? AND uc.ref_type='dm' AND uc.ref_id=CAST(u.id AS CHAR)
      WHERE u.id != ?
      AND u.id NOT IN (SELECT blocked_user_id FROM blocked_users WHERE user_id = ?)
-     ORDER BY u.username ASC`,
-    [req.user.id, req.user.id],
+     ORDER BY last_message_time DESC, u.username ASC`,
+    [req.user.id, req.user.id, req.user.id],
     (err, rows) => {
-      if (err) return res.status(500).json({ message: 'Database error: ' + err.message });
+      if (err) {
+        // Fallback - simple query without unread_counts
+        req.db.query(
+          `SELECT u.id, u.username, u.email, u.avatar_color, u.avatar_url, u.bio, u.status, u.last_seen, u.role, u.user_code,
+           0 as last_message_time, 0 as unread_count
+           FROM users u
+           WHERE u.id != ?
+           AND u.id NOT IN (SELECT blocked_user_id FROM blocked_users WHERE user_id = ?)
+           ORDER BY u.username ASC`,
+          [req.user.id, req.user.id],
+          (err2, rows2) => {
+            if (err2) return res.status(500).json({ message: 'Database error' });
+            res.json(rows2);
+          }
+        );
+        return;
+      }
       res.json(rows);
     }
   );
