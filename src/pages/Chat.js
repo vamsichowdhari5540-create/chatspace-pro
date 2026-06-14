@@ -322,6 +322,10 @@ export default function Chat() {
   useEffect(() => {
     socket = io('https://gong-unbend-chief.ngrok-free.dev');
     socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
+    // Join all group rooms for notifications
+    setTimeout(() => {
+      if (groups.length > 0) groups.forEach(g => socket.emit('joinGroup', g.id));
+    }, 1000);
     socket.on('onlineUsers', setOnlineUsers);
     socket.on('groupCreated', () => loadGroups());
     // Role updated by admin - update permissions instantly
@@ -381,11 +385,16 @@ export default function Chat() {
       const ts = Date.now();
       const isSender = Number(msg.user_id) === Number(userIdRef.current);
       const isViewing = activeGroupRef.current && Number(activeGroupRef.current.id) === Number(msg.group_id);
-      console.log('🔔 newGroupMessage:', msg.group_id, 'isSender:', isSender, 'isViewing:', isViewing, 'userIdRef:', userIdRef.current, 'msg.user_id:', msg.user_id);
       setLastMessageTimes(prev => ({ ...prev, [`group_${msg.group_id}`]: ts }));
       if (!isSender && !isViewing) {
-        console.log('✅ Adding unread for group:', msg.group_id);
         addUnread(`group_${msg.group_id}`, ts, msg.user_id);
+        // Show popup toast for group messages
+        addToast({ 
+          title: msg.username || 'Group Message', 
+          message: msg.text?.includes('[IMAGE]') ? '📷 Image' : msg.text?.includes('[FILE]') ? '📎 File' : msg.text?.substring(0,60) || '...',
+          avatar: { color: msg.avatar_color, letter: msg.username?.[0]?.toUpperCase() }
+        });
+        showPushNotif(msg.username, msg.text?.substring(0,60) || '📷');
       }
       if (isViewing) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
     });
@@ -414,6 +423,10 @@ export default function Chat() {
     });
     loadUsers(); loadGroups(); loadMessages('channel','announcements');
     loadUnreadCounts();
+    // Join ALL channel rooms so we receive notifications from all channels
+    ['announcements', 'tech-updates', 'job-notifications'].forEach(ch => {
+      socket.emit('joinRoom', ch);
+    });
     // Check if user can post in default channel
     if (user.role !== 'admin') {
       axios.get(`${API}/admin/can-post/announcements`).then(r => setCanPost(r.data.canPost)).catch(() => {});
@@ -442,7 +455,16 @@ export default function Chat() {
   }, [messages, activeDM]);
 
   const loadUsers = async () => { try { const r = await axios.get(`${API}/users`); setUsers(r.data); } catch {} };
-  const loadGroups = async () => { try { const r = await axios.get(`${API}/groups`); setGroups(r.data); } catch {} };
+  const loadGroups = async () => {
+    try {
+      const r = await axios.get(`${API}/groups`);
+      setGroups(r.data);
+      // Join ALL group rooms so we receive messages from all groups
+      if (socket) {
+        r.data.forEach(g => socket.emit('joinGroup', g.id));
+      }
+    } catch {}
+  };
   const loadBlockedUsers = async () => { try { const r = await axios.get(`${API}/users/blocked`); setBlockedUsers(r.data); } catch {} };
 
   const addUnread = useCallback((key, timestamp, senderId) => {
@@ -555,8 +577,7 @@ export default function Chat() {
       }
       else {
         r = await axios.get(`${API}/groups/${id}/messages`);
-        // Leave all other group rooms first
-        socket.emit('leaveAllGroups');
+        // Join this group room (stay in all other rooms for notifications)
         socket.emit('joinGroup', id);
         clearUnread(`group_${id}`);
       }
@@ -596,7 +617,7 @@ export default function Chat() {
     setInput(''); setReplyTo(null); setShowEmoji(false);
     try {
       if (activeDM) { const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text }); socket.emit('sendPrivateMessage', { ...r.data, avatar_color:user.avatar_color }); }
-      else if (activeGroup) { const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text }); socket.emit('sendGroupMessage', { ...r.data, avatar_color:user.avatar_color }); }
+      else if (activeGroup) { const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text }); socket.emit('sendGroupMessage', { ...r.data, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username }); }
       else { const r = await axios.post(`${API}/messages`, { room:activeChannel, text }); socket.emit('sendMessage', { ...r.data, room:activeChannel, avatar_color:user.avatar_color }); }
     } catch {}
   };
@@ -634,7 +655,7 @@ export default function Chat() {
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeGroup) {
         const mr = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text });
-        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color, group_id: activeGroup.id };
         if (socket) socket.emit('sendGroupMessage', { ...finalMsg, group_id: activeGroup.id });
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeChannel) {
@@ -666,7 +687,7 @@ export default function Chat() {
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeGroup) {
         const mr = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text });
-        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color };
+        const finalMsg = { ...mr.data, username: user.username, avatar_color: user.avatar_color, group_id: activeGroup.id };
         if (socket) socket.emit('sendGroupMessage', { ...finalMsg, group_id: activeGroup.id });
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeChannel) {
