@@ -1,3 +1,19 @@
+/**
+ * ============================================================
+ * ChatSpace Pro
+ * ============================================================
+ * Copyright (c) 2026 Venkata Vamsi. All Rights Reserved.
+ *
+ * This file is part of ChatSpace Pro — a proprietary software.
+ * Unauthorized copying, modification, or distribution of this
+ * file, via any medium, is strictly prohibited.
+ *
+ * Developer : Venkata Vamsi
+ * Email     : vamsichowdhari5540@gmail.com
+ * GitHub    : https://github.com/vamsichowdhari5540-create
+ * ============================================================
+ */
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import axios from 'axios';
