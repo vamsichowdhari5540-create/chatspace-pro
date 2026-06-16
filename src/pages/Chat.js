@@ -1201,8 +1201,13 @@ export default function Chat() {
           <div className={`flex items-center gap-1 mt-0.5 px-1 ${isOwn?'flex-row-reverse':'flex-row'}`}>
             <span className="text-xs" style={{ color:'rgba(150,180,255,0.4)' }}>{new Date(msg.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
             {isOwn && (() => {
-              const isSeen = msg.seen_at && msg.seen_at !== 'null' && msg.seen_at !== null;
-              return <CheckCheck size={13} style={{ color: isSeen ? '#2563eb' : dark ? 'rgba(150,180,255,0.4)' : '#94a3b8' }} />;
+              const isSeen = !!(msg.seen_at && msg.seen_at !== 'null' && msg.seen_at !== null && msg.seen_at !== undefined);
+              return (
+                <CheckCheck
+                  size={13}
+                  style={{ color: isSeen ? '#2563eb' : dark ? 'rgba(150,180,255,0.4)' : '#94a3b8', flexShrink:0 }}
+                />
+              );
             })()}
           </div>
 
