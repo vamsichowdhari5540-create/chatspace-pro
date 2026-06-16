@@ -122,10 +122,13 @@ router.get('/:room', auth, (req, res) => {
 
 // ── SEND CHANNEL MESSAGE ──
 router.post('/', auth, (req, res) => {
-  const { room, text } = req.body;
+  const { room, text, reply_to_id, reply_to_text, reply_to_username } = req.body;
   if (!room || !text) return res.status(400).json({ message: 'Room and text required' });
   const ts = Date.now();
-  req.db.query('INSERT INTO messages (user_id,room,text) VALUES (?,?,?)', [req.user.id, room, text], (err, result) => {
+  req.db.query(
+    'INSERT INTO messages (user_id,room,text,reply_to_id,reply_to_text,reply_to_username) VALUES (?,?,?,?,?,?)',
+    [req.user.id, room, text, reply_to_id||null, reply_to_text||null, reply_to_username||null],
+    (err, result) => {
     if (err) { console.error('DB error:', err.message); return res.status(500).json({ message: 'Database error: ' + err.message }); }
     // Save unread for ALL other users
     req.db.query('SELECT id FROM users WHERE id!=?', [req.user.id], (e, users) => {
@@ -139,7 +142,7 @@ router.post('/', auth, (req, res) => {
         );
       }
     });
-    res.status(201).json({ id:result.insertId, user_id:req.user.id, room, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0 });
+    res.status(201).json({ id:result.insertId, user_id:req.user.id, room, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0, reply_to_id:reply_to_id||null, reply_to_text:reply_to_text||null, reply_to_username:reply_to_username||null });
   });
 });
 
@@ -174,13 +177,16 @@ router.get('/private/:userId', auth, (req, res) => {
 
 // ── SEND PRIVATE MESSAGE ──
 router.post('/private', auth, (req, res) => {
-  const { to_user_id, text } = req.body;
+  const { to_user_id, text, reply_to_id, reply_to_text, reply_to_username } = req.body;
   if (!to_user_id || !text) return res.status(400).json({ message: 'Required fields missing' });
   const ts = Date.now();
   const toId = parseInt(to_user_id);
   const fromId = parseInt(req.user.id);
   console.log(`💬 DM from ${fromId} to ${toId}`);
-  req.db.query('INSERT INTO private_messages (from_user_id,to_user_id,text) VALUES (?,?,?)', [fromId, toId, text], (err, result) => {
+  req.db.query(
+    'INSERT INTO private_messages (from_user_id,to_user_id,text,reply_to_id,reply_to_text,reply_to_username) VALUES (?,?,?,?,?,?)',
+    [fromId, toId, text, reply_to_id||null, reply_to_text||null, reply_to_username||null],
+    (err, result) => {
     if (err) { console.error('DB error:', err.message); return res.status(500).json({ message: 'Database error: ' + err.message }); }
     // Save unread for RECEIVER (count+1)
     req.db.query(
@@ -194,7 +200,7 @@ router.post('/private', auth, (req, res) => {
       [fromId, 'dm', String(toId), ts, ts],
       (err3) => { console.log(`📬 Sender time saved for user ${fromId}:`, err3 ? err3.message : 'OK'); }
     );
-    res.status(201).json({ id:result.insertId, from_user_id:fromId, to_user_id:toId, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0 });
+    res.status(201).json({ id:result.insertId, from_user_id:fromId, to_user_id:toId, text, username:req.user.username, created_at:new Date(), edited:0, deleted:0, reply_to_id:reply_to_id||null, reply_to_text:reply_to_text||null, reply_to_username:reply_to_username||null });
   });
 });
 

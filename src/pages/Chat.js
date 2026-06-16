@@ -25,7 +25,7 @@ import {
   Phone, Video, PhoneOff, VideoOff, Mic, MicOff,
   PhoneMissed, Edit2, Trash2, Forward, Pin,
   Bell, BellOff, UserX, UserCheck, Clock,
-  Check, User, Save, Settings
+  Check, User, Save, Settings, Camera
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
@@ -439,8 +439,7 @@ export default function Chat() {
     });
     loadUsers(); loadGroups(); loadMessages('channel', 'announcements', false);
     loadUnreadCounts();
-    // Also reload unread counts after a short delay to ensure DB is ready
-    setTimeout(() => loadUnreadCounts(), 1500);
+    setTimeout(() => loadUnreadCounts(), 2000);
     // Join ALL channel rooms so we receive notifications from all channels
     ['announcements', 'tech-updates', 'job-notifications'].forEach(ch => {
       socket.emit('joinRoom', ch);
@@ -456,7 +455,12 @@ export default function Chat() {
     return () => { socket.disconnect(); cleanupCall(); };
   }, []);
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages]);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior:'smooth' });
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [messages]);
   useEffect(() => { activeChannelRef.current = activeChannel; }, [activeChannel]);
   useEffect(() => { activeDMRef.current = activeDM; }, [activeDM]);
   useEffect(() => { activeGroupRef.current = activeGroup; }, [activeGroup]);
@@ -602,7 +606,7 @@ export default function Chat() {
         socket.emit('joinGroup', id);
         if (shouldClearUnread) clearUnread(`group_${id}`);
       }
-      setMessages(r.data);
+      setMessages(r.data.slice(-100)); // Only render last 100 messages for performance
     } catch {}
   };
 
@@ -640,27 +644,51 @@ export default function Chat() {
   const sendMessage = async () => {
     if (!input.trim()) return;
     const text = input.trim();
+    const replyData = replyTo ? {
+      reply_to_id: replyTo.id,
+      reply_to_text: replyTo.text ? replyTo.text.substring(0,100) : replyTo.image_url ? '📷 Image' : '📎 File',
+      reply_to_username: replyTo.username
+    } : {};
+
     setInput(''); setReplyTo(null); setShowEmoji(false);
     try {
-      if (activeDM) { const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text }); socket.emit('sendPrivateMessage', { ...r.data, avatar_color:user.avatar_color }); }
-      else if (activeGroup) { const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text }); socket.emit('sendGroupMessage', { ...r.data, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username }); }
-      else { const r = await axios.post(`${API}/messages`, { room:activeChannel, text }); socket.emit('sendMessage', { ...r.data, room:activeChannel, avatar_color:user.avatar_color }); }
-    } catch {}
+      if (activeDM) {
+        const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text, ...replyData });
+        const finalMsg = { ...r.data, ...replyData, avatar_color:user.avatar_color, username:user.username };
+        socket.emit('sendPrivateMessage', finalMsg);
+        setMessages(prev => [...prev, finalMsg]);
+      } else if (activeGroup) {
+        const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text, ...replyData });
+        const finalMsg = { ...r.data, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username };
+        socket.emit('sendGroupMessage', finalMsg);
+        setMessages(prev => [...prev, finalMsg]);
+      } else if (activeChannel) {
+        const r = await axios.post(`${API}/messages`, { room:activeChannel, text, ...replyData });
+        const finalMsg = { ...r.data, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username };
+        socket.emit('sendMessage', finalMsg);
+        setMessages(prev => [...prev, finalMsg]);
+      }
+    } catch(err) { console.error('Send error:', err); }
   };
 
   const handleTyping = e => {
     setInput(e.target.value);
-    // Only emit typing for channels, not DMs or groups (to avoid cross-chat bug)
     if (activeChannel) {
-      socket.emit('typing', { room:activeChannel, username:user.username, isTyping:true });
+      // Only emit typing if not already typing (debounce)
+      if (!typingTimeoutRef.current) {
+        socket.emit('typing', { room:activeChannel, username:user.username, isTyping:true });
+      }
       clearTimeout(typingTimeoutRef.current);
-      typingTimeoutRef.current = setTimeout(() => socket.emit('typing', { room:activeChannel, username:user.username, isTyping:false }), 1500);
+      typingTimeoutRef.current = setTimeout(() => {
+        socket.emit('typing', { room:activeChannel, username:user.username, isTyping:false });
+        typingTimeoutRef.current = null;
+      }, 1500);
     }
-    // Clear typing when switching to DM or group
-    if (activeDM || activeGroup) {
-      setTypingUsers([]);
-    }
+    if (activeDM || activeGroup) setTypingUsers([]);
   };
+
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
 
   const handleFileShare = async e => {
     const file = e.target.files[0]; if (!file) return;
@@ -668,8 +696,16 @@ export default function Chat() {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      addToast({ title:'Uploading...', message:file.name });
-      const r = await axios.post(`${API}/messages/upload-file`, fd);
+      setIsUploading(true);
+      setUploadProgress(0);
+      const r = await axios.post(`${API}/messages/upload-file`, fd, {
+        onUploadProgress: (progressEvent) => {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          setUploadProgress(percent);
+        }
+      });
+      setIsUploading(false);
+      setUploadProgress(0);
       const baseUrl = window.location.origin.includes('localhost') ? 'https://gong-unbend-chief.ngrok-free.dev' : window.location.origin;
       const fileUrl = `${baseUrl}${r.data.file_url}`;
       const text = `[FILE]${JSON.stringify({ url: fileUrl, name: r.data.file_name, size: r.data.file_size, type: r.data.file_type })}[/FILE]`;
@@ -923,7 +959,22 @@ export default function Chat() {
     }
   };
 
-  const handleReaction = (msgId, emoji) => { socket.emit('addReaction', { messageId:msgId, emoji, userId:user.id, username:user.username }); setContextMenu(null); };
+  const handleReaction = (msgId, emoji) => {
+    const room = activeChannel || (activeGroup ? `group_${activeGroup.id}` : `dm_${activeDM?.id}`);
+    socket.emit('addReaction', { messageId:msgId, emoji, userId:user.id, username:user.username, room });
+    // Update local state immediately
+    setReactions(prev => {
+      const msgReactions = { ...(prev[msgId] || {}) };
+      const users = msgReactions[emoji] ? [...msgReactions[emoji]] : [];
+      const existing = users.findIndex(u => u.userId === user.id);
+      if (existing >= 0) users.splice(existing, 1); // toggle off
+      else users.push({ userId: user.id, username: user.username }); // add
+      if (users.length === 0) delete msgReactions[emoji];
+      else msgReactions[emoji] = users;
+      return { ...prev, [msgId]: msgReactions };
+    });
+    setContextMenu(null);
+  };
   const handleContextMenu = (e, msg) => {
     e.preventDefault();
     const menuWidth = 190;
@@ -1070,7 +1121,7 @@ export default function Chat() {
     const isChannel = !!activeChannel;
 
     return (
-      <motion.div key={msg.id}
+      <motion.div key={msg.id} id={`msg-${msg.id}`}
         initial={{ opacity:0, y:8, x:isOwn?20:-20 }}
         animate={{ opacity:1, y:0, x:0 }}
         transition={{ duration:0.25, ease:[0.34,1.56,0.64,1] }}
@@ -1100,6 +1151,14 @@ export default function Chat() {
             borderRadius: isOwn ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
             boxShadow: isOwn ? '0 4px 15px rgba(74,144,226,0.25)' : 'none',
           }}>
+            {/* Reply Quote */}
+            {msg.reply_to_text && !isDeleted && (
+              <div onClick={()=>{ const el=document.getElementById(`msg-${msg.reply_to_id}`); if(el) el.scrollIntoView({behavior:'smooth',block:'center'}); }}
+                style={{ background:'rgba(74,144,226,0.12)', borderLeft:'3px solid #4A90E2', borderRadius:6, padding:'4px 8px', marginBottom:6, cursor:'pointer' }}>
+                <div style={{ fontSize:10, fontWeight:700, color:'#4A90E2', marginBottom:1 }}>↩ {msg.reply_to_username}</div>
+                <div style={{ fontSize:11, color:'rgba(180,200,255,0.8)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:200 }}>{msg.reply_to_text}</div>
+              </div>
+            )}
             {isDeleted ? (
               <p className="text-xs italic" style={{ color:'rgba(150,180,255,0.4)' }}>🚫 This message was deleted</p>
             ) : imageMatch ? (
@@ -1141,7 +1200,10 @@ export default function Chat() {
 
           <div className={`flex items-center gap-1 mt-0.5 px-1 ${isOwn?'flex-row-reverse':'flex-row'}`}>
             <span className="text-xs" style={{ color:'rgba(150,180,255,0.4)' }}>{new Date(msg.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
-            {isOwn && (msg.seen_at ? <CheckCheck size={12} style={{ color:'#4A90E2' }} /> : <CheckCheck size={12} style={{ color:'rgba(150,180,255,0.4)' }} />)}
+            {isOwn && (() => {
+              const isSeen = msg.seen_at && msg.seen_at !== 'null' && msg.seen_at !== null;
+              return <CheckCheck size={13} style={{ color: isSeen ? '#2563eb' : dark ? 'rgba(150,180,255,0.4)' : '#94a3b8' }} />;
+            })()}
           </div>
 
           {Object.keys(msgReactions).length > 0 && (
@@ -1149,7 +1211,8 @@ export default function Chat() {
               {Object.entries(msgReactions).map(([emoji, users]) => (
                 <span key={emoji} onClick={()=>handleReaction(msg.id,emoji)}
                   className="text-xs rounded-full px-2 py-0.5 cursor-pointer transition-all hover:scale-110"
-                  style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.25)' }}>
+                  title={users.map(u=>u.username).join(', ')}
+                  style={{ background: users.find(u=>u.userId===user.id) ? 'rgba(74,144,226,0.35)' : 'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.4)', color:'white' }}>
                   {emoji} {users.length}
                 </span>
               ))}
@@ -1578,6 +1641,18 @@ export default function Chat() {
                   <Paperclip size={17}/>
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*" style={{ display:'none' }} onChange={handleImageUpload}/>
+                {/* Upload progress bar */}
+                {isUploading && (
+                  <div style={{ position:'absolute', bottom:'100%', left:0, right:0, padding:'8px 16px', background:'rgba(3,8,28,0.95)', borderTop:'1px solid rgba(74,144,226,0.2)' }}>
+                    <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}>
+                      <span style={{ fontSize:11, color:'rgba(150,180,255,0.7)' }}>Uploading...</span>
+                      <span style={{ fontSize:11, color:'#4A90E2', fontWeight:700 }}>{uploadProgress}%</span>
+                    </div>
+                    <div style={{ height:4, background:'rgba(74,144,226,0.15)', borderRadius:4, overflow:'hidden' }}>
+                      <div style={{ height:'100%', width:`${uploadProgress}%`, background:'linear-gradient(90deg,#2563eb,#4A90E2)', borderRadius:4, transition:'width 0.2s ease' }}/>
+                    </div>
+                  </div>
+                )}
                 <button onClick={()=>fileShareInputRef.current?.click()} className="p-2 rounded-xl transition-all hover:scale-110 flex-shrink-0" title="Share File" style={{ color:'rgba(150,180,255,0.6)' }}>
                   <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="12" y2="12"/><line x1="15" y1="15" x2="12" y2="12"/>
@@ -1943,14 +2018,42 @@ export default function Chat() {
               <span className="text-xs font-mono px-2 py-1 rounded-lg" style={{ background:'rgba(74,144,226,0.15)', color:'rgba(100,160,255,0.9)', border:'1px solid rgba(74,144,226,0.25)' }}>ID: {formatUID(user.id)}</span>
             </div>
             <div className="flex flex-col items-center gap-3 mb-5">
-              <div className="relative cursor-pointer group" onClick={()=>avatarInputRef.current?.click()}>
-                <Avatar user={{ ...user, avatar_color:accountForm.avatar_color }} size={80} />
-                <div className="absolute inset-0 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity" style={{ background:'rgba(0,0,0,0.5)' }}>
-                  <span className="text-white text-xs font-semibold">Change</span>
+              <div style={{ position:'relative', display:'inline-block' }}>
+                <div className="relative cursor-pointer group" onClick={()=>avatarInputRef.current?.click()}>
+                  <Avatar user={{ ...user, avatar_color:accountForm.avatar_color }} size={80} />
+                  <div className="absolute inset-0 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity" style={{ background:'rgba(0,0,0,0.6)' }}>
+                    <Camera size={18} color="white"/>
+                  </div>
                 </div>
+                {user.avatar_url && (
+                  <button
+                    onClick={async()=>{
+                      try {
+                        await axios.put(`${API}/users/profile`, { avatar_url: '' });
+                        setUser(prev => ({ ...prev, avatar_url: null }));
+                        addToast({ title:'Profile photo removed!', message:'' });
+                      } catch(err) {
+                        console.error('Remove avatar error:', err.response?.data || err.message);
+                        addToast({ title:'Failed to remove', message: err.response?.data?.message || err.message });
+                      }
+                    }}
+                    title="Remove profile photo"
+                    style={{ position:'absolute', top:-2, right:-2, width:24, height:24, borderRadius:'50%', background:'#ef4444', border:'2px solid #0a0f1e', display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', zIndex:10 }}>
+                    <X size={12} color="white"/>
+                  </button>
+                )}
               </div>
-              <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={async e=>{await updateAvatar(e.target.files[0]);}}/>
-              <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>Click to change avatar photo</p>
+              <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={async e=>{
+                const file = e.target.files[0];
+                if (!file) return;
+                // Show simple crop confirmation
+                const url = URL.createObjectURL(file);
+                const confirmed = window.confirm('Upload this photo as your profile picture?');
+                URL.revokeObjectURL(url);
+                if (!confirmed) { e.target.value=''; return; }
+                await updateAvatar(file);
+              }}/>
+              <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>Click photo to change · ✕ to remove</p>
             </div>
             <div className="space-y-4">
               <div>

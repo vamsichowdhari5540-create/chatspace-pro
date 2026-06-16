@@ -401,3 +401,8 @@ body.light .message-bubble span.text-xs {
 body.light .message-bubble .text-xs {
   color: rgba(50, 80, 150, 0.6) !important;
 }
+
+/* ── BLUE TICK FIX ── */
+.message-bubble .seen-tick { color: #2563eb !important; }
+.message-bubble .unseen-tick { color: #94a3b8 !important; }
+body.light .message-bubble .unseen-tick { color: #64748b !important; }

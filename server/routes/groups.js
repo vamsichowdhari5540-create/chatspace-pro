@@ -107,13 +107,13 @@ router.get('/:id/messages', auth, (req, res) => {
 
 // ── SEND GROUP MESSAGE ──
 router.post('/:id/messages', auth, (req, res) => {
-  const { text } = req.body;
+  const { text, reply_to_id, reply_to_text, reply_to_username } = req.body;
   if (!text) return res.status(400).json({ message: 'Text required' });
   const ts = Date.now();
   const groupId = req.params.id;
   req.db.query(
-    'INSERT INTO group_messages (group_id, user_id, text) VALUES (?,?,?)',
-    [groupId, req.user.id, text],
+    'INSERT INTO group_messages (group_id, user_id, text, reply_to_id, reply_to_text, reply_to_username) VALUES (?,?,?,?,?,?)',
+    [groupId, req.user.id, text, reply_to_id||null, reply_to_text||null, reply_to_username||null],
     (err, result) => {
       if (err) return res.status(500).json({ message: 'Database error' });
 
@@ -135,7 +135,7 @@ router.post('/:id/messages', auth, (req, res) => {
         }
       );
 
-      res.status(201).json({ id: result.insertId, group_id: groupId, user_id: req.user.id, text, username: req.user.username, created_at: new Date(), edited: 0, deleted: 0 });
+      res.status(201).json({ id: result.insertId, group_id: groupId, user_id: req.user.id, text, username: req.user.username, created_at: new Date(), edited: 0, deleted: 0, reply_to_id:reply_to_id||null, reply_to_text:reply_to_text||null, reply_to_username:reply_to_username||null });
     }
   );
 });

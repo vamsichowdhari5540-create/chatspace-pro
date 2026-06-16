@@ -113,6 +113,23 @@ router.put('/status', auth, (req, res) => {
   });
 });
 
+// ── UPDATE PROFILE (username, bio, avatar_color, avatar_url) ──
+router.put('/profile', auth, (req, res) => {
+  const { username, bio, avatar_color, avatar_url } = req.body;
+  const fields = [];
+  const values = [];
+  if (username !== undefined) { fields.push('username=?'); values.push(username); }
+  if (bio !== undefined) { fields.push('bio=?'); values.push(bio); }
+  if (avatar_color !== undefined) { fields.push('avatar_color=?'); values.push(avatar_color); }
+  if (avatar_url !== undefined) { fields.push('avatar_url=?'); values.push(avatar_url === '' || avatar_url === null || avatar_url === 'REMOVE' ? null : avatar_url); }
+  if (!fields.length) return res.status(400).json({ message: 'Nothing to update' });
+  values.push(req.user.id);
+  req.db.query(`UPDATE users SET ${fields.join(',')} WHERE id=?`, values, (err) => {
+    if (err) return res.status(500).json({ message: 'Database error: ' + err.message });
+    res.json({ message: 'Profile updated' });
+  });
+});
+
 // ── UPLOAD AVATAR ──
 router.post('/avatar', auth, (req, res) => {
   avatarUpload.single('avatar')(req, res, (err) => {

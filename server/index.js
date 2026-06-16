@@ -16,12 +16,14 @@
 
 require('dotenv').config();
 const express = require('express');
+const compression = require('compression');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 
 const app = express();
+app.use(compression()); // Compress all responses - reduces bandwidth by 70%
 const server = http.createServer(app);
 const io = new Server(server, { 
   cors: { origin: '*', methods: ['GET', 'POST'] },
@@ -36,7 +38,22 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Limit request size
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Simple rate limiter for API routes
+const requestCounts = {};
+app.use('/api', (req, res, next) => {
+  const ip = req.ip;
+  const now = Date.now();
+  if (!requestCounts[ip]) requestCounts[ip] = { count: 0, resetAt: now + 60000 };
+  if (now > requestCounts[ip].resetAt) { requestCounts[ip] = { count: 0, resetAt: now + 60000 }; }
+  requestCounts[ip].count++;
+  if (requestCounts[ip].count > 200) { // 200 requests per minute per IP
+    return res.status(429).json({ message: 'Too many requests, please slow down' });
+  }
+  next();
+});
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/uploads/files', express.static(path.join(__dirname, 'uploads/files')));
 
@@ -87,7 +104,22 @@ io.on('connection', (socket) => {
   });
 
   socket.on('addReaction', (data) => {
-    io.to(data.room || socket.id).emit('messageReaction', data);
+    const { messageId, emoji, userId, username, room } = data;
+    // Toggle reaction in memory
+    if (!global.reactions) global.reactions = {};
+    if (!global.reactions[messageId]) global.reactions[messageId] = {};
+    const msgReactions = global.reactions[messageId];
+    if (!msgReactions[emoji]) msgReactions[emoji] = [];
+    const existing = msgReactions[emoji].findIndex(u => u.userId === userId);
+    if (existing >= 0) msgReactions[emoji].splice(existing, 1);
+    else msgReactions[emoji].push({ userId, username });
+    if (msgReactions[emoji].length === 0) delete msgReactions[emoji];
+    // Broadcast to room
+    if (room) {
+      io.to(room).emit('messageReaction', { messageId, reactions: msgReactions });
+    } else {
+      io.emit('messageReaction', { messageId, reactions: msgReactions });
+    }
   });
 
   socket.on('editMessage', (data) => io.emit('messageEdited', data));
