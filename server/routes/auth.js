@@ -53,34 +53,24 @@ const sendVerificationEmail = async (email, code, companyName) => {
 router.post('/login', async (req, res) => {
   const { userId, password } = req.body;
   if (!userId || !password) return res.status(400).json({ message: 'User ID and password required' });
-
   const parsed = parseUserId(userId);
   if (!parsed) return res.status(400).json({ message: 'Invalid User ID format. Use CSP-COMPANY-000001' });
-
   try {
-    // Get company from master DB
     const company = await getCompanyByCode(parsed.code);
     if (!company) return res.status(400).json({ message: `Company "${parsed.code}" not found or inactive` });
-
-    // Get company DB
     const db = getCompanyDb(company.db_name);
-
-    // Find user by numeric id
     db.query('SELECT * FROM users WHERE id=?', [parsed.numericId], (err, rows) => {
       if (err) return res.status(500).json({ message: 'Database error' });
       if (!rows.length) return res.status(400).json({ message: 'Invalid User ID or password' });
-
       const user = rows[0];
       if (!bcrypt.compareSync(password, user.password)) {
         return res.status(400).json({ message: 'Invalid User ID or password' });
       }
-
       const token = jwt.sign(
         { id: user.id, username: user.username, email: user.email, role: user.role, companyCode: parsed.code, dbName: company.db_name },
         process.env.JWT_SECRET,
         { expiresIn: '7d' }
       );
-
       res.json({
         token,
         user: {
@@ -96,6 +86,8 @@ router.post('/login', async (req, res) => {
           companyCode: parsed.code,
           companyName: company.name,
           dbName: company.db_name,
+          // ── E2E ENCRYPTION: tell frontend whether this user already has keys set up ──
+          hasPublicKey: !!user.public_key,
         }
       });
     });
@@ -146,48 +138,39 @@ router.post('/send-code', async (req, res) => {
 });
 
 // ── REGISTER ──
+// E2E CHANGE: now accepts an optional `publicKey` so the keypair generated
+// in-browser during signup can be stored immediately.
 router.post('/register', async (req, res) => {
-  const { email, password, username, companyCode, avatar_color } = req.body;
+  const { email, password, username, companyCode, avatar_color, publicKey } = req.body;
   if (!email || !password || !companyCode) return res.status(400).json({ message: 'All fields required' });
   try {
     const company = await getCompanyByCode(companyCode);
     if (!company) return res.status(400).json({ message: 'Company not found' });
     const db = getCompanyDb(company.db_name);
-
     db.query('SELECT id FROM users WHERE email=?', [email], (err, rows) => {
       if (err) return res.status(500).json({ message: 'Database error' });
       if (rows.length) return res.status(400).json({ message: 'Email already registered' });
-
       const finalUsername = username?.trim() || email.split('@')[0];
       db.query('SELECT id FROM users WHERE username=?', [finalUsername], (err, rows) => {
         if (err) return res.status(500).json({ message: 'Database error' });
         if (rows.length) return res.status(400).json({ message: 'Username already taken' });
-
-        // Check max users limit
         db.query('SELECT COUNT(*) as count FROM users', (err, countRows) => {
           if (err) return res.status(500).json({ message: 'Database error' });
           if (countRows[0].count >= company.max_users) return res.status(400).json({ message: 'Company user limit reached' });
-
           const hash = bcrypt.hashSync(password, 10);
           const isFirstUser = countRows[0].count === 0;
-
           db.query(
-            'INSERT INTO users (email, password, username, avatar_color, role) VALUES (?,?,?,?,?)',
-            [email, hash, finalUsername, avatar_color || '#4A90E2', isFirstUser ? 'admin' : 'member'],
+            'INSERT INTO users (email, password, username, avatar_color, role, public_key) VALUES (?,?,?,?,?,?)',
+            [email, hash, finalUsername, avatar_color || '#4A90E2', isFirstUser ? 'admin' : 'member', publicKey || null],
             (err, result) => {
               if (err) return res.status(500).json({ message: 'Database error' });
-
               const userId = generateUserId(companyCode, result.insertId);
-              // Save user_code
               db.query('UPDATE users SET user_code=? WHERE id=?', [userId, result.insertId]);
-
               const token = jwt.sign(
                 { id: result.insertId, username: finalUsername, email, companyCode, dbName: company.db_name },
                 process.env.JWT_SECRET,
                 { expiresIn: '7d' }
               );
-
-              // Send welcome email with User ID
               transporter.sendMail({
                 from: `"ChatSpace Pro" <${process.env.EMAIL_USER}>`,
                 to: email,
@@ -209,7 +192,6 @@ router.post('/register', async (req, res) => {
                   </div>
                 `
               }).catch(err => console.error('Welcome email error:', err.message));
-
               res.status(201).json({
                 token,
                 user: {
@@ -223,6 +205,7 @@ router.post('/register', async (req, res) => {
                   companyCode,
                   companyName: company.name,
                   dbName: company.db_name,
+                  hasPublicKey: !!publicKey,
                 }
               });
             }
@@ -236,32 +219,58 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// ── E2E ENCRYPTION: SAVE/UPDATE MY PUBLIC KEY ──
+// Called once right after first login if hasPublicKey was false (key was generated client-side, never existed before)
+router.post('/save-public-key', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'No token' });
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const { publicKey } = req.body;
+    if (!publicKey) return res.status(400).json({ message: 'publicKey required' });
+    const db = getCompanyDb(decoded.dbName);
+    db.query('UPDATE users SET public_key=? WHERE id=?', [publicKey, decoded.id], (err) => {
+      if (err) return res.status(500).json({ message: 'Database error' });
+      res.json({ message: 'Public key saved' });
+    });
+  } catch (err) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+});
+
+// ── E2E ENCRYPTION: GET SOMEONE'S PUBLIC KEY (needed before encrypting a message to them) ──
+router.get('/public-key/:userId', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'No token' });
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const db = getCompanyDb(decoded.dbName);
+    db.query('SELECT public_key FROM users WHERE id=?', [req.params.userId], (err, rows) => {
+      if (err) return res.status(500).json({ message: 'Database error' });
+      if (!rows.length) return res.status(404).json({ message: 'User not found' });
+      res.json({ publicKey: rows[0].public_key });
+    });
+  } catch (err) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+});
+
 // ── CREATE COMPANY (Super Admin) ──
 router.post('/create-company', async (req, res) => {
   const { name, code, adminEmail, adminPassword, maxUsers, superAdminKey } = req.body;
-  // Simple super admin key protection
   if (superAdminKey !== process.env.SUPER_ADMIN_KEY) return res.status(403).json({ message: 'Unauthorized' });
   if (!name || !code) return res.status(400).json({ message: 'Name and code required' });
-
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, '');
   const dbName = `chatspace_${cleanCode.toLowerCase()}`;
-
   try {
-    // Check if code already exists
     const existing = await getCompanyByCode(cleanCode);
     if (existing) return res.status(400).json({ message: 'Company code already exists' });
-
-    // Create company database
     await createCompanyDatabase(dbName);
-
-    // Save to master
     masterDb.query(
       'INSERT INTO companies (name, code, db_name, admin_email, max_users) VALUES (?,?,?,?,?)',
       [name, cleanCode, dbName, adminEmail || '', maxUsers || 1000],
       async (err, result) => {
         if (err) return res.status(500).json({ message: 'Database error: ' + err.message });
-
-        // Create admin user in company DB if email/password provided
         if (adminEmail && adminPassword) {
           const db = getCompanyDb(dbName);
           const hash = bcrypt.hashSync(adminPassword, 10);
@@ -273,7 +282,6 @@ router.post('/create-company', async (req, res) => {
               if (!err) {
                 const userId = generateUserId(cleanCode, userResult.insertId);
                 db.query('UPDATE users SET user_code=? WHERE id=?', [userId, userResult.insertId]);
-                // Send welcome email to admin
                 try {
                   await transporter.sendMail({
                     from: `"ChatSpace Pro" <${process.env.EMAIL_USER}>`,
@@ -305,7 +313,6 @@ router.post('/create-company', async (req, res) => {
             }
           );
         }
-
         res.status(201).json({
           message: `Company "${name}" created successfully!`,
           company: { id: result.insertId, name, code: cleanCode, dbName },
@@ -324,39 +331,30 @@ router.post('/register-company', async (req, res) => {
   if (!companyName || !companyCode || !adminEmail || !adminPassword) {
     return res.status(400).json({ message: 'All fields required' });
   }
-
   const cleanCode = companyCode.toUpperCase().replace(/[^A-Z0-9]/g, '');
   if (cleanCode.length < 2 || cleanCode.length > 10) {
     return res.status(400).json({ message: 'Company code must be 2-10 characters' });
   }
-
   const dbName = `chatspace_${cleanCode.toLowerCase()}`;
-
   try {
     const existing = await getCompanyByCode(cleanCode);
     if (existing) return res.status(400).json({ message: 'Company code already taken' });
-
     await createCompanyDatabase(dbName);
-
     masterDb.query(
       'INSERT INTO companies (name, code, db_name, admin_email) VALUES (?,?,?,?)',
       [companyName, cleanCode, dbName, adminEmail],
       (err, result) => {
         if (err) return res.status(500).json({ message: 'Database error' });
-
         const db = getCompanyDb(dbName);
         const hash = bcrypt.hashSync(adminPassword, 10);
         const username = adminUsername || adminEmail.split('@')[0];
-
         db.query(
           'INSERT INTO users (email, password, username, role, avatar_color) VALUES (?,?,?,?,?)',
           [adminEmail, hash, username, 'admin', '#4A90E2'],
           (err, userResult) => {
             if (err) return res.status(500).json({ message: 'Failed to create admin user' });
-
             const userId = generateUserId(cleanCode, userResult.insertId);
             db.query('UPDATE users SET user_code=? WHERE id=?', [userId, userResult.insertId]);
-
             res.status(201).json({
               message: 'Company registered successfully!',
               company: { name: companyName, code: cleanCode },

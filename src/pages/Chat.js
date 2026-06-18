@@ -28,6 +28,7 @@ import {
   Check, User, Save, Settings, Camera
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { useE2EEncryption } from '../hooks/useE2EEncryption';
 import { useTheme } from '../context/ThemeContext';
 import { useToast } from '../context/ToastContext';
 import EmojiPicker from 'emoji-picker-react';
@@ -209,17 +210,24 @@ const ActiveCall = ({ callType, remoteUser, onEnd, localVideoRef, remoteVideoRef
 
 export default function Chat() {
   const { user, logout, updateAvatar, setUser } = useAuth();
+  const e2e = useE2EEncryption(user, axios, API);
+  const groupKeyCacheRef = useRef({});
+  const channelKeyCacheRef = useRef({});
   const { dark, toggle } = useTheme();
   const { addToast } = useToast();
 
   const [activeChannel, setActiveChannel] = useState('announcements');
   const [activeDM, setActiveDM] = useState(null);
   const [activeGroup, setActiveGroup] = useState(null);
+  const messageInputRef = useRef(null); // for autofocus on conversation switch, WhatsApp-style
+  const [editingGroupName, setEditingGroupName] = useState(false);
+  const [groupNameInput, setGroupNameInput] = useState('');
   const [messages, setMessages] = useState([]);
   const [users, setUsers] = useState([]);
   const [groups, setGroups] = useState([]);
   const [onlineUsers, setOnlineUsers] = useState([]);
   const [input, setInput] = useState('');
+  const [drafts, setDrafts] = useState({}); // { 'dm_5': 'unsent text...', 'group_3': '...', 'channel_announcements': '...' } — keeps each conversation's typed-but-not-sent message separate, like WhatsApp
   const [typingUsers, setTypingUsers] = useState([]);
   const [replyTo, setReplyTo] = useState(null);
   const [showEmoji, setShowEmoji] = useState(false);
@@ -229,6 +237,7 @@ export default function Chat() {
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
   const [showAccount, setShowAccount] = useState(false);
+  const [viewingProfile, setViewingProfile] = useState(null); // user object being viewed read-only, or null
   const [groupName, setGroupName] = useState('');
   const [groupMembers, setGroupMembers] = useState('');
   const [groupError, setGroupError] = useState('');
@@ -329,6 +338,17 @@ export default function Chat() {
     if ('Notification' in window && Notification.permission==='default') Notification.requestPermission();
   }, []);
 
+  // WhatsApp-style autofocus + per-conversation draft restore: the moment you
+  // switch to a channel, DM, or group, the cursor should already be active in
+  // the message box, AND it should show whatever unsent text you'd typed in
+  // THIS specific conversation before (not leftover text from a different one).
+  useEffect(() => {
+    const key = getCurrentConvoKey();
+    setInput(key ? (drafts[key] || '') : '');
+    messageInputRef.current?.focus();
+  }, [activeChannel, activeDM, activeGroup]);
+
+
   const showPushNotif = (title, body) => {
     if (!notifEnabled) return;
     if ('Notification' in window && Notification.permission==='granted' && document.hidden)
@@ -366,53 +386,77 @@ export default function Chat() {
       setGroups(prev => prev.filter(g => g.id !== groupId));
       if (activeGroup?.id === groupId) { setActiveGroup(null); setMessages([]); }
     });
-    socket.on('newMessage', msg => {
+    socket.on('newMessage', async msg => {
       const ts = Date.now();
       const isSender = Number(msg.user_id) === Number(userIdRef.current);
       const isViewing = msg.room === activeChannelRef.current;
       setLastMessageTimes(prev => ({ ...prev, [`channel_${msg.room}`]: ts }));
       if (!isViewing) addUnread(`channel_${msg.room}`, ts, msg.user_id);
-      if (isViewing) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+
+      let displayMsg = msg;
+      if (msg.is_encrypted) {
+        const encKey = channelKeyCacheRef.current[msg.room] || await fetchChannelKey(msg.room);
+        const [decryptedArr] = await Promise.all([
+          e2e.decryptIncoming([msg], { type: 'channel', channelName: msg.room, myEncryptedChannelKey: encKey })
+        ]);
+        displayMsg = decryptedArr[0];
+      }
+
+      if (isViewing) setMessages(prev => prev.find(m=>m.id===displayMsg.id) ? prev : [...prev, displayMsg]);
       if (!isSender) {
-        addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} });
-        showPushNotif(msg.username, msg.text?.substring(0,60)||'📷');
+        addToast({ title:displayMsg.username, message:displayMsg.text?.substring(0,60)||'📷 Image', avatar:{color:displayMsg.avatar_color,letter:displayMsg.username?.[0]?.toUpperCase()} });
+        showPushNotif(displayMsg.username, displayMsg.text?.substring(0,60)||'📷');
       }
     });
 
-    socket.on('newPrivateMessage', msg => {
+    socket.on('newPrivateMessage', async msg => {
       const ts = Date.now();
       const isSender = Number(msg.from_user_id) === Number(userIdRef.current);
       const dmId = isSender ? msg.to_user_id : msg.from_user_id;
       const isViewing = activeDMRef.current && Number(activeDMRef.current.id) === Number(dmId);
-      console.log('🔔 newPrivateMessage:', 'isSender:', isSender, 'dmId:', dmId, 'isViewing:', isViewing, 'userIdRef:', userIdRef.current);
       setLastMessageTimes(prev => ({ ...prev, [`dm_${dmId}`]: ts }));
-      if (!isSender && !isViewing) {
-        console.log('✅ Adding unread for DM:', dmId);
-        addUnread(`dm_${dmId}`, ts, msg.from_user_id);
+      if (!isSender && !isViewing) addUnread(`dm_${dmId}`, ts, msg.from_user_id);
+
+      let displayMsg = msg;
+      if (msg.is_encrypted) {
+        const [decryptedArr] = await Promise.all([
+          e2e.decryptIncoming([msg], { type: 'dm', peerId: dmId })
+        ]);
+        displayMsg = decryptedArr[0];
       }
-      if (isViewing || isSender) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+
+      if (isViewing || isSender) setMessages(prev => prev.find(m=>m.id===displayMsg.id) ? prev : [...prev, displayMsg]);
       if (!isSender) {
-        addToast({ title:msg.username, message:msg.text?.substring(0,60)||'📷 Image', avatar:{color:msg.avatar_color,letter:msg.username?.[0]?.toUpperCase()} });
-        showPushNotif(msg.username, msg.text?.substring(0,60)||'📷');
+        addToast({ title:displayMsg.username, message:displayMsg.text?.substring(0,60)||'📷 Image', avatar:{color:displayMsg.avatar_color,letter:displayMsg.username?.[0]?.toUpperCase()} });
+        showPushNotif(displayMsg.username, displayMsg.text?.substring(0,60)||'📷');
       }
     });
 
-    socket.on('newGroupMessage', msg => {
+    socket.on('newGroupMessage', async msg => {
       const ts = Date.now();
       const isSender = Number(msg.user_id) === Number(userIdRef.current);
       const isViewing = activeGroupRef.current && Number(activeGroupRef.current.id) === Number(msg.group_id);
       setLastMessageTimes(prev => ({ ...prev, [`group_${msg.group_id}`]: ts }));
+
+      let displayMsg = msg;
+      if (msg.is_encrypted) {
+        const encKey = groupKeyCacheRef.current[msg.group_id] || await fetchGroupKey(msg.group_id);
+        const [decryptedArr] = await Promise.all([
+          e2e.decryptIncoming([msg], { type: 'group', groupId: msg.group_id, myEncryptedGroupKey: encKey })
+        ]);
+        displayMsg = decryptedArr[0];
+      }
+
       if (!isSender && !isViewing) {
         addUnread(`group_${msg.group_id}`, ts, msg.user_id);
-        // Show popup toast for group messages
-        addToast({ 
-          title: msg.username || 'Group Message', 
-          message: msg.text?.includes('[IMAGE]') ? '📷 Image' : msg.text?.includes('[FILE]') ? '📎 File' : msg.text?.substring(0,60) || '...',
-          avatar: { color: msg.avatar_color, letter: msg.username?.[0]?.toUpperCase() }
+        addToast({
+          title: displayMsg.username || 'Group Message',
+          message: displayMsg.text?.includes('[IMAGE]') ? '📷 Image' : displayMsg.text?.includes('[FILE]') ? '📎 File' : displayMsg.text?.substring(0,60) || '...',
+          avatar: { color: displayMsg.avatar_color, letter: displayMsg.username?.[0]?.toUpperCase() }
         });
-        showPushNotif(msg.username, msg.text?.substring(0,60) || '📷');
+        showPushNotif(displayMsg.username, displayMsg.text?.substring(0,60) || '📷');
       }
-      if (isViewing) setMessages(prev => prev.find(m=>m.id===msg.id) ? prev : [...prev,msg]);
+      if (isViewing) setMessages(prev => prev.find(m=>m.id===displayMsg.id) ? prev : [...prev, displayMsg]);
     });
     socket.on('userTyping', ({ username, isTyping, room }) => {
       // Only show typing if:
@@ -588,30 +632,65 @@ export default function Chat() {
     } catch {}
   };
 
+  const fetchGroupKey = async (groupId) => {
+    if (groupKeyCacheRef.current[groupId]) return groupKeyCacheRef.current[groupId];
+    try {
+      const r = await axios.get(`${API}/groups/${groupId}/key`);
+      groupKeyCacheRef.current[groupId] = r.data.encryptedKey;
+      return r.data.encryptedKey;
+    } catch { return null; }
+  };
+
+  const fetchChannelKey = async (channelName) => {
+    if (channelKeyCacheRef.current[channelName]) return channelKeyCacheRef.current[channelName];
+    try {
+      const r = await axios.get(`${API}/messages/channel-key/${channelName}`);
+      channelKeyCacheRef.current[channelName] = r.data.encryptedKey;
+      return r.data.encryptedKey;
+    } catch { return null; }
+  };
+
   const loadMessages = async (type, id, shouldClearUnread = false) => {
     try {
       setMessages([]);
       let r;
+      let context = { type };
+
       if (type==='channel') {
         r = await axios.get(`${API}/messages/${id}`);
         socket.emit('joinRoom', id);
         if (shouldClearUnread) clearUnread(`channel_${id}`);
+        context.channelName = id;
+        context.myEncryptedChannelKey = await fetchChannelKey(id);
       }
       else if (type==='dm') {
         r = await axios.get(`${API}/messages/private/${id}`);
         if (shouldClearUnread) clearUnread(`dm_${id}`);
+        context.peerId = id;
       }
       else {
         r = await axios.get(`${API}/groups/${id}/messages`);
         socket.emit('joinGroup', id);
         if (shouldClearUnread) clearUnread(`group_${id}`);
+        context.groupId = id;
+        context.myEncryptedGroupKey = await fetchGroupKey(id);
       }
-      setMessages(r.data.slice(-100)); // Only render last 100 messages for performance
-    } catch {}
+
+      const recent = r.data.slice(-100);
+      // Show messages immediately with a "decrypting" placeholder for encrypted ones,
+      // rather than blocking the whole UI (and the input box) until every single
+      // message has gone through RSA+AES decryption. This is what makes switching
+      // conversations feel instant even when there are many encrypted messages —
+      // text fills in progressively a moment later instead of freezing the screen.
+      setMessages(recent.map(m => (m.is_encrypted && m.ciphertext) ? { ...m, text: null, _decrypting: true } : m));
+      const decrypted = await e2e.decryptIncoming(recent, context);
+      setMessages(decrypted);
+    } catch (err) { console.error('loadMessages error:', err); }
   };
 
   const switchChannel = async ch => {
     setTypingUsers([]);
+    setViewingProfile(null); // defensive: prevent a stale profile-viewer overlay from silently blocking clicks/input after switching
     clearUnread(`channel_${ch}`);
     setActiveChannel(ch); setActiveDM(null); setActiveGroup(null); loadMessages('channel', ch, true);
     if (user.role === 'admin') { setCanPost(true); return; }
@@ -624,11 +703,13 @@ export default function Chat() {
     setLastMessageTimes(prev => ({ ...prev, [`dm_${u.id}`]: Date.now() }));
     clearUnread(`dm_${u.id}`);
     setTypingUsers([]);
+    setViewingProfile(null); // defensive: same fix as switchChannel above
     setActiveDM(u); setActiveChannel(null); setActiveGroup(null); loadMessages('dm', u.id, true);
   };
   const switchGroup = async g => {
     setLastMessageTimes(prev => ({ ...prev, [`group_${g.id}`]: Date.now() }));
     clearUnread(`group_${g.id}`);
+    setViewingProfile(null); // defensive: same fix as switchChannel above
     setTypingUsers([]);
     setActiveGroup(g); setActiveChannel(null); setActiveDM(null); loadMessages('group', g.id, true);
     try {
@@ -651,28 +732,38 @@ export default function Chat() {
     } : {};
 
     setInput(''); setReplyTo(null); setShowEmoji(false);
+    const sentKey = getCurrentConvoKey();
+    if (sentKey) setDrafts(prev => ({ ...prev, [sentKey]: '' })); // clear this conversation's saved draft now that it's been sent
     try {
       if (activeDM) {
-        const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text, ...replyData });
-        const finalMsg = { ...r.data, ...replyData, avatar_color:user.avatar_color, username:user.username };
-        socket.emit('sendPrivateMessage', finalMsg);
+        const enc = await e2e.encryptOutgoing(text, { type: 'dm', peerId: activeDM.id });
+        const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, ...enc, ...replyData });
+        const finalMsg = { ...r.data, text, ...replyData, avatar_color:user.avatar_color, username:user.username };
+        socket.emit('sendPrivateMessage', { ...r.data, ...replyData, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeGroup) {
-        const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text, ...replyData });
-        const finalMsg = { ...r.data, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username };
-        socket.emit('sendGroupMessage', finalMsg);
+        const myEncryptedGroupKey = groupKeyCacheRef.current[activeGroup.id] || await fetchGroupKey(activeGroup.id);
+        const enc = await e2e.encryptOutgoing(text, { type: 'group', groupId: activeGroup.id, myEncryptedGroupKey });
+        const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { ...enc, ...replyData });
+        const finalMsg = { ...r.data, text, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username };
+        socket.emit('sendGroupMessage', { ...r.data, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeChannel) {
-        const r = await axios.post(`${API}/messages`, { room:activeChannel, text, ...replyData });
-        const finalMsg = { ...r.data, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username };
-        socket.emit('sendMessage', finalMsg);
+        const myEncryptedChannelKey = channelKeyCacheRef.current[activeChannel] || await fetchChannelKey(activeChannel);
+        const enc = await e2e.encryptOutgoing(text, { type: 'channel', channelName: activeChannel, myEncryptedChannelKey });
+        const r = await axios.post(`${API}/messages`, { room:activeChannel, ...enc, ...replyData });
+        const finalMsg = { ...r.data, text, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username };
+        socket.emit('sendMessage', { ...r.data, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
       }
     } catch(err) { console.error('Send error:', err); }
   };
 
   const handleTyping = e => {
-    setInput(e.target.value);
+    const value = e.target.value;
+    setInput(value);
+    const key = getCurrentConvoKey();
+    if (key) setDrafts(prev => ({ ...prev, [key]: value }));
     if (activeChannel) {
       // Only emit typing if not already typing (debounce)
       if (!typingTimeoutRef.current) {
@@ -1046,6 +1137,58 @@ export default function Chat() {
     }
   };
 
+  // E2E: bootstrap (or re-key) this group's shared AES key, encrypted for every
+  // current member's RSA public key. Safe to call on groups created before
+  // encryption existed — uses /key/rotate which works whether group_keys is
+  // currently empty (version becomes 1) or already populated (version increments).
+  const [enablingEncryption, setEnablingEncryption] = useState(false);
+  const handleEnableGroupEncryption = async () => {
+    if (!activeGroup) return;
+    setEnablingEncryption(true);
+    try {
+      const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
+      const members = r.data;
+      const missingKey = members.find(m => !m.public_key);
+      if (missingKey) {
+        addToast({ title:'Cannot enable yet', message:`${missingKey.username} hasn't logged in since encryption was added` });
+        setEnablingEncryption(false);
+        return;
+      }
+      const memberPublicKeys = members.map(m => ({ userId: m.id, publicKeyB64: m.public_key }));
+      const { encryptedKeys } = await e2e.createGroupKeys(memberPublicKeys);
+      await axios.post(`${API}/groups/${activeGroup.id}/key/rotate`, { memberKeys: encryptedKeys });
+      groupKeyCacheRef.current[activeGroup.id] = encryptedKeys.find(k => k.userId === user.id)?.encryptedKey;
+      addToast({ title:'🔐 Encryption enabled!', message:'New messages in this group are now end-to-end encrypted' });
+    } catch (err) {
+      console.error('Enable group encryption failed:', err);
+      addToast({ title:'Failed to enable encryption', message: err.response?.data?.message || '' });
+    } finally {
+      setEnablingEncryption(false);
+    }
+  };
+
+  // NOTE: Channels (Announcements, Tech Updates, Job Notifications) are
+  // intentionally NOT end-to-end encrypted. They're company-wide broadcast
+  // spaces with no real "membership" to encrypt against, and the content is
+  // meant to be readable by everyone in the org anyway — the same reason
+  // Slack/Teams don't E2E-encrypt public channels. E2E here is scoped to
+  // DMs and Groups, where confidentiality between specific people matters.
+
+  const handleRenameGroup = async () => {
+    const newName = groupNameInput.trim();
+    if (!newName || newName === activeGroup.name) { setEditingGroupName(false); return; }
+    try {
+      await axios.put(`${API}/groups/${activeGroup.id}`, { name: newName });
+      setActiveGroup(prev => ({ ...prev, name: newName }));
+      setGroups(prev => prev.map(g => g.id === activeGroup.id ? { ...g, name: newName } : g));
+      addToast({ title: 'Group renamed!', message: newName });
+      setEditingGroupName(false);
+    } catch (err) {
+      console.error('Rename group error:', err);
+      addToast({ title: 'Failed to rename group', message: err.response?.data?.message || '' });
+    }
+  };
+
   const isOnline = id => onlineUsers.some(u=>u.id===id);
   const isBlocked = id => blockedUsers.some(u=>u.id===id);
   const filteredMessages = searchQuery ? messages.filter(m=>m.text?.toLowerCase().includes(searchQuery.toLowerCase())) : messages;
@@ -1056,6 +1199,10 @@ export default function Chat() {
     String(u.id).includes(searchQuery)
   );
   const getChatTitle = () => activeDM ? activeDM.username : activeGroup ? activeGroup.name : `#${activeChannel}`;
+  // Unique key for whichever conversation is currently open — used to keep each
+  // conversation's unsent draft text separate (so typing in one DM and switching
+  // to another doesn't leak that text into the wrong conversation).
+  const getCurrentConvoKey = () => activeDM ? `dm_${activeDM.id}` : activeGroup ? `group_${activeGroup.id}` : activeChannel ? `channel_${activeChannel}` : null;
 
   const formatFileSize = (bytes) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -1159,7 +1306,12 @@ export default function Chat() {
                 <div style={{ fontSize:11, color:'rgba(180,200,255,0.8)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:200 }}>{msg.reply_to_text}</div>
               </div>
             )}
-            {isDeleted ? (
+            {msg._decrypting ? (
+              <p className="text-xs italic flex items-center gap-1.5" style={{ color:'rgba(150,180,255,0.5)' }}>
+                <span style={{ width:8, height:8, borderRadius:'50%', background:'currentColor', display:'inline-block', animation:'pulseGlow 1.2s ease-in-out infinite' }}/>
+                Decrypting…
+              </p>
+            ) : isDeleted ? (
               <p className="text-xs italic" style={{ color:'rgba(150,180,255,0.4)' }}>🚫 This message was deleted</p>
             ) : imageMatch ? (
               <img src={imageUrl2} alt="shared"
@@ -1236,7 +1388,7 @@ export default function Chat() {
   };
 
   // ── IMAGE VIEWER ──
-  const ImageViewer = ({ src, onClose }) => {
+  const ImageViewer = ({ src, onClose, hideDownload = false }) => {
     const [zoom, setZoom] = useState(1);
     const [pos, setPos] = useState({ x:0, y:0 });
     const [dragging, setDragging] = useState(false);
@@ -1283,28 +1435,30 @@ export default function Chat() {
           <button onClick={e=>{e.stopPropagation();setZoom(1);setPos({x:0,y:0});}}
             className="px-3 h-9 rounded-full text-white text-xs font-semibold transition-all hover:scale-110"
             style={{ background:'rgba(74,144,226,0.3)', border:'1px solid rgba(74,144,226,0.5)' }}>Reset</button>
-          <button onClick={async e=>{
-            e.stopPropagation();
-            try {
-              const response = await fetch(src);
-              const blob = await response.blob();
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = `chatspace_image_${Date.now()}.${blob.type.split('/')[1] || 'jpg'}`;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              URL.revokeObjectURL(url);
-            } catch {
-              // Fallback - open in new tab
-              window.open(src, '_blank');
-            }
-          }}
-            className="px-3 h-9 rounded-full text-white text-xs font-semibold flex items-center gap-1 transition-all hover:scale-110"
-            style={{ background:'rgba(34,197,94,0.3)', border:'1px solid rgba(34,197,94,0.5)' }}>
-            ⬇ Download
-          </button>
+          {!hideDownload && (
+            <button onClick={async e=>{
+              e.stopPropagation();
+              try {
+                const response = await fetch(src);
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `chatspace_image_${Date.now()}.${blob.type.split('/')[1] || 'jpg'}`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+              } catch {
+                // Fallback - open in new tab
+                window.open(src, '_blank');
+              }
+            }}
+              className="px-3 h-9 rounded-full text-white text-xs font-semibold flex items-center gap-1 transition-all hover:scale-110"
+              style={{ background:'rgba(34,197,94,0.3)', border:'1px solid rgba(34,197,94,0.5)' }}>
+              ⬇ Download
+            </button>
+          )}
           <button onClick={onClose}
             className="w-9 h-9 rounded-full flex items-center justify-center text-white transition-all hover:scale-110"
             style={{ background:'rgba(239,68,68,0.3)', border:'1px solid rgba(239,68,68,0.5)' }}>✕</button>
@@ -1522,14 +1676,18 @@ export default function Chat() {
 
         {/* Header */}
         <div className="chat-header h-14 flex items-center px-4 gap-3 flex-shrink-0">
-          {activeDM ? <Avatar user={activeDM} size={32} showStatus /> : (
+          {activeDM ? (
+            <button onClick={()=>setViewingProfile(activeDM)} className="hover:scale-105 transition-transform">
+              <Avatar user={activeDM} size={32} showStatus />
+            </button>
+          ) : (
             <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background:'rgba(74,144,226,0.15)', border:'1px solid rgba(74,144,226,0.25)' }}>
               {activeGroup ? <Users size={15} style={{ color:'#4A90E2' }}/> : <Hash size={15} style={{ color:'#4A90E2' }}/>}
             </div>
           )}
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="font-bold text-sm text-white">{getChatTitle()}</h2>
+              <h2 className={`font-bold text-sm text-white ${activeDM ? 'cursor-pointer hover:underline' : ''}`} onClick={()=>{ if (activeDM) setViewingProfile(activeDM); }}>{getChatTitle()}</h2>
               {activeDM && <span className="text-xs px-1.5 py-0.5 rounded-md font-mono" style={{ background:'rgba(74,144,226,0.15)', color:'rgba(100,160,255,0.8)', border:'1px solid rgba(74,144,226,0.2)' }}>{formatUID(activeDM.id)}</span>}
             </div>
             {activeDM && <p className="text-xs" style={{ color:'rgba(150,180,255,0.5)' }}>{isOnline(activeDM.id) ? `● ${STATUS_CONFIG[activeDM.status||'online']?.label}` : `Last seen ${formatLastSeen(activeDM.last_seen)}`}</p>}
@@ -1664,7 +1822,7 @@ export default function Chat() {
                   </svg>
                 </button>
                 <input ref={fileShareInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,.rar,.txt,.csv,.mp3,.mp4,.json" style={{ display:'none' }} onChange={handleFileShare}/>
-                <textarea value={input} onChange={handleTyping}
+                <textarea ref={messageInputRef} value={input} onChange={handleTyping}
                   onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();} }}
                   placeholder={`Message ${getChatTitle()}...`} rows={1}
                   className="flex-1 bg-transparent text-sm text-white focus:outline-none resize-none py-1.5 max-h-32"
@@ -1900,7 +2058,29 @@ export default function Chat() {
       {showAdminPanel && activeGroup && (
         <div style={modalOverlay} onClick={()=>setShowAdminPanel(false)}>
           <motion.div initial={{ scale:0.9, y:20 }} animate={{ scale:1, y:0 }} onClick={e=>e.stopPropagation()} style={{ ...modalCard, maxHeight:'80vh', overflowY:'auto' }}>
-            <h2 className="text-lg font-bold text-white mb-5 flex items-center gap-2"><Users size={19} style={{ color:'#4A90E2' }}/> {activeGroup.name}</h2>
+            {editingGroupName ? (
+              <div className="flex items-center gap-2 mb-5">
+                <input
+                  autoFocus
+                  value={groupNameInput}
+                  onChange={e => setGroupNameInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleRenameGroup(); if (e.key === 'Escape') setEditingGroupName(false); }}
+                  style={{ ...inputSt, flex: 1 }}
+                />
+                <button onClick={handleRenameGroup} className="p-2 rounded-lg" style={{ background:'rgba(34,197,94,0.15)', border:'1px solid rgba(34,197,94,0.3)', color:'#22c55e' }}><Check size={15}/></button>
+                <button onClick={()=>setEditingGroupName(false)} className="p-2 rounded-lg" style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}><X size={15}/></button>
+              </div>
+            ) : (
+              <h2 className="text-lg font-bold text-white mb-5 flex items-center gap-2">
+                <Users size={19} style={{ color:'#4A90E2' }}/> {activeGroup.name}
+                {activeGroup.admin_id===user.id && (
+                  <button onClick={()=>{ setGroupNameInput(activeGroup.name); setEditingGroupName(true); }}
+                    className="p-1 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.5)' }} title="Rename group">
+                    <Edit2 size={14}/>
+                  </button>
+                )}
+              </h2>
+            )}
             {activeGroup.admin_id===user.id && (
               <div className="mb-4">
                 <p className="text-xs font-bold uppercase tracking-wider mb-2" style={{ color:'rgba(150,180,255,0.5)' }}>Add Member</p>
@@ -1981,6 +2161,13 @@ export default function Chat() {
                 </div>
               ))}
             </div>
+            {activeGroup.admin_id===user.id && (
+              <button onClick={handleEnableGroupEncryption} disabled={enablingEncryption}
+                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102"
+                style={{ background:'rgba(34,197,94,0.1)', border:'1px solid rgba(34,197,94,0.25)', color:'#22c55e', opacity: enablingEncryption?0.6:1 }}>
+                🔐 {enablingEncryption ? 'Enabling…' : 'Enable End-to-End Encryption'}
+              </button>
+            )}
             {activeGroup.admin_id!==user.id ? (
               <button onClick={handleLeaveGroup} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102" style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}>
                 <LogOut size={14}/> Leave Group
@@ -2099,6 +2286,41 @@ export default function Chat() {
         </div>
       )}
 
+      {/* ── VIEW PROFILE MODAL (read-only, for viewing another user's profile) ── */}
+      {viewingProfile && (
+        <div style={modalOverlay} onClick={()=>setViewingProfile(null)}>
+          <motion.div initial={{ scale:0.9, y:20 }} animate={{ scale:1, y:0 }} onClick={e=>e.stopPropagation()} style={{ ...modalCard, maxWidth:340 }}>
+            <div className="flex items-center justify-between mb-5">
+              <h2 className="text-lg font-bold text-white flex items-center gap-2"><User size={19} style={{ color:'#4A90E2' }}/> Profile</h2>
+              <button onClick={()=>setViewingProfile(null)} className="p-1 rounded-lg hover:scale-110 transition-all" style={{ color:'rgba(150,180,255,0.5)' }}><X size={16}/></button>
+            </div>
+            <div className="flex flex-col items-center gap-3 mb-5">
+              <button
+                onClick={()=>{ if (viewingProfile.avatar_url) setImageViewer({ src:`https://gong-unbend-chief.ngrok-free.dev${viewingProfile.avatar_url}`, hideDownload:true }); }}
+                className={viewingProfile.avatar_url ? 'cursor-pointer hover:scale-105 transition-transform' : 'cursor-default'}
+                title={viewingProfile.avatar_url ? 'View full photo' : ''}>
+                <Avatar user={viewingProfile} size={88} showStatus />
+              </button>
+              <div className="text-center">
+                <p className="text-base font-bold text-white">{viewingProfile.username}</p>
+                <p className="text-xs font-mono mt-1" style={{ color:'rgba(100,160,255,0.7)' }}>{formatUID(viewingProfile.id)}</p>
+              </div>
+              <p className="text-xs" style={{ color: STATUS_CONFIG[viewingProfile.status||'online']?.hex }}>
+                {isOnline(viewingProfile.id) ? `● ${STATUS_CONFIG[viewingProfile.status||'online']?.label}` : `Last seen ${formatLastSeen(viewingProfile.last_seen)}`}
+              </p>
+              {viewingProfile.bio && <p className="text-sm text-center italic mt-1" style={{ color:'rgba(200,220,255,0.7)' }}>"{viewingProfile.bio}"</p>}
+              {viewingProfile.role && <span className="text-xs px-2 py-1 rounded-lg mt-2" style={{ background:'rgba(245,158,11,0.12)', border:'1px solid rgba(245,158,11,0.25)', color:'#f59e0b' }}>{viewingProfile.role}</span>}
+            </div>
+            <div className="flex gap-3">
+              <button onClick={()=>{ setViewingProfile(null); switchDM(viewingProfile); }} style={btnPrimary}>
+                <Send size={14} style={{ display:'inline', marginRight:6 }}/> Message
+              </button>
+              <button onClick={()=>setViewingProfile(null)} style={{ ...btnPrimary, background:'rgba(255,255,255,0.06)', boxShadow:'none', border:'1px solid rgba(74,144,226,0.2)', color:'rgba(150,180,255,0.7)' }}>Close</button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
       {/* INCOMING CALL */}
       <AnimatePresence>
         {incomingCall && <IncomingCall caller={incomingCall.fromUser} callType={incomingCall.callType} onAccept={acceptCall} onReject={rejectCall}/>}
@@ -2111,7 +2333,13 @@ export default function Chat() {
 
       {/* IMAGE VIEWER */}
       <AnimatePresence>
-        {imageViewer && <ImageViewer src={imageViewer} onClose={()=>setImageViewer(null)} />}
+        {imageViewer && (
+          <ImageViewer
+            src={typeof imageViewer === 'string' ? imageViewer : imageViewer.src}
+            hideDownload={typeof imageViewer === 'object' && !!imageViewer.hideDownload}
+            onClose={()=>setImageViewer(null)}
+          />
+        )}
       </AnimatePresence>
 
       {/* ── ADMIN USERS PANEL ── */}
