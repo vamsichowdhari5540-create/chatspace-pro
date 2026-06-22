@@ -6,6 +6,7 @@ import { ToastProvider } from './context/ToastContext';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Chat from './pages/Chat';
+import ResetPassword from './pages/ResetPassword';
 
 const PrivateRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -31,6 +32,11 @@ function AppRoutes() {
     <Routes>
       <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
       <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
+      {/* Reset Password is reachable whether logged in or not (e.g. clicking
+          the email link from a different browser/device than the one
+          currently logged in), so it's intentionally NOT wrapped in
+          PublicRoute or PrivateRoute. */}
+      <Route path="/reset-password" element={<ResetPassword />} />
       <Route path="/chat" element={<PrivateRoute><Chat /></PrivateRoute>} />
       <Route path="*" element={<Navigate to="/chat" />} />
     </Routes>

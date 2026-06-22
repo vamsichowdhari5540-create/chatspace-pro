@@ -6,6 +6,7 @@ import Globe from 'react-globe.gl';
 import axios from 'axios';
 axios.defaults.headers.common['ngrok-skip-browser-warning'] = 'true';
 
+const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
 
 const ARCS = [
   { startLat:51.5,startLng:-0.1,endLat:40.7,endLng:-74.0 },
@@ -93,12 +94,23 @@ const ForgotModal = ({ onClose }) => {
     gsap.to(overlayRef.current, { opacity:0, duration:0.3, onComplete:onClose });
   };
 
+  // ── WIRED UP: actually calls the backend instead of just simulating success.
+  // The backend always responds with a generic success message whether or not
+  // the email exists, so this UI always shows the "Check your inbox" screen too
+  // — that's intentional, it prevents this form from being used to check which
+  // emails are registered in the system.
   const handleSend = async (e) => {
     e.preventDefault();
     if (!email) { setError('Please enter your email'); return; }
     setLoading(true); setError('');
-    await new Promise(r => setTimeout(r, 1500));
-    setSent(true); setLoading(false);
+    try {
+      await axios.post(`${API}/auth/forgot-password`, { email: email.trim() });
+      setSent(true);
+    } catch (err) {
+      setError(err.response?.data?.message || 'Something went wrong. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (

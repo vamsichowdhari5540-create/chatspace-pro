@@ -18,6 +18,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const { masterDb, getCompanyDb, createCompanyDatabase, getCompanyByCode, parseUserId, generateUserId } = require('../config/db_manager');
 
@@ -86,7 +87,6 @@ router.post('/login', async (req, res) => {
           companyCode: parsed.code,
           companyName: company.name,
           dbName: company.db_name,
-          // ── E2E ENCRYPTION: tell frontend whether this user already has keys set up ──
           hasPublicKey: !!user.public_key,
         }
       });
@@ -138,8 +138,6 @@ router.post('/send-code', async (req, res) => {
 });
 
 // ── REGISTER ──
-// E2E CHANGE: now accepts an optional `publicKey` so the keypair generated
-// in-browser during signup can be stored immediately.
 router.post('/register', async (req, res) => {
   const { email, password, username, companyCode, avatar_color, publicKey } = req.body;
   if (!email || !password || !companyCode) return res.status(400).json({ message: 'All fields required' });
@@ -220,7 +218,6 @@ router.post('/register', async (req, res) => {
 });
 
 // ── E2E ENCRYPTION: SAVE/UPDATE MY PUBLIC KEY ──
-// Called once right after first login if hasPublicKey was false (key was generated client-side, never existed before)
 router.post('/save-public-key', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -228,7 +225,7 @@ router.post('/save-public-key', async (req, res) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const { publicKey } = req.body;
     if (!publicKey) return res.status(400).json({ message: 'publicKey required' });
-    const db = getCompanyDb(decoded.dbName);
+    const db = decoded.dbName ? getCompanyDb(decoded.dbName) : require('../config/db');
     db.query('UPDATE users SET public_key=? WHERE id=?', [publicKey, decoded.id], (err) => {
       if (err) return res.status(500).json({ message: 'Database error' });
       res.json({ message: 'Public key saved' });
@@ -238,13 +235,13 @@ router.post('/save-public-key', async (req, res) => {
   }
 });
 
-// ── E2E ENCRYPTION: GET SOMEONE'S PUBLIC KEY (needed before encrypting a message to them) ──
+// ── E2E ENCRYPTION: GET SOMEONE'S PUBLIC KEY ──
 router.get('/public-key/:userId', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ message: 'No token' });
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const db = getCompanyDb(decoded.dbName);
+    const db = decoded.dbName ? getCompanyDb(decoded.dbName) : require('../config/db');
     db.query('SELECT public_key FROM users WHERE id=?', [req.params.userId], (err, rows) => {
       if (err) return res.status(500).json({ message: 'Database error' });
       if (!rows.length) return res.status(404).json({ message: 'User not found' });
@@ -252,6 +249,117 @@ router.get('/public-key/:userId', async (req, res) => {
     });
   } catch (err) {
     res.status(401).json({ message: 'Invalid token' });
+  }
+});
+
+// ============================================================
+// FORGOT PASSWORD / RESET PASSWORD
+// ============================================================
+const findUserByEmailAcrossCompanies = (email) => new Promise((resolve, reject) => {
+  masterDb.query('SELECT db_name, name FROM companies WHERE is_active=1', (err, companies) => {
+    if (err) return reject(err);
+    if (!companies.length) return resolve(null);
+    let remaining = companies.length;
+    let found = null;
+    companies.forEach(company => {
+      const db = getCompanyDb(company.db_name);
+      db.query('SELECT * FROM users WHERE email=?', [email], (err2, rows) => {
+        remaining--;
+        if (!err2 && rows.length && !found) {
+          found = { user: rows[0], dbName: company.db_name, companyName: company.name };
+        }
+        if (remaining === 0) resolve(found);
+      });
+    });
+  });
+});
+
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: 'Email required' });
+  const genericResponse = { message: 'If an account with that email exists, a reset link has been sent.' };
+  try {
+    const result = await findUserByEmailAcrossCompanies(email);
+    if (!result) return res.json(genericResponse);
+    const { user, dbName, companyName } = result;
+    const db = getCompanyDb(dbName);
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    db.query(
+      'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (?,?,?)',
+      [user.id, token, expiresAt],
+      async (err) => {
+        if (err) {
+          console.error('Forgot-password token insert error:', err.message);
+          return res.json(genericResponse);
+        }
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://gong-unbend-chief.ngrok-free.dev'}/reset-password?token=${token}&db=${encodeURIComponent(dbName)}`;
+        try {
+          await transporter.sendMail({
+            from: `"ChatSpace Pro" <${process.env.EMAIL_USER}>`,
+            to: email,
+            subject: `🔑 Reset your ${companyName} password`,
+            html: `
+              <div style="font-family:'Segoe UI',sans-serif;background:#050914;padding:40px;border-radius:16px;max-width:480px;margin:0 auto;">
+                <h1 style="color:#4A90E2;text-align:center;margin:0 0 8px">ChatSpace Pro</h1>
+                <p style="color:#a0b0d0;text-align:center;margin:0 0 30px">${companyName} Workspace</p>
+                <p style="color:#fff;font-size:16px;">Hi <strong>${user.username}</strong>,</p>
+                <p style="color:#a0b0d0;font-size:14px;">We received a request to reset your password. Click the button below to choose a new one. This link expires in 1 hour.</p>
+                <div style="text-align:center;margin:28px 0;">
+                  <a href="${resetUrl}" style="display:inline-block;background:linear-gradient(135deg,#4A90E2,#2563eb);color:white;padding:14px 32px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;">Reset Password</a>
+                </div>
+                <p style="color:#506080;font-size:12px;">If you didn't request this, you can safely ignore this email — your password will remain unchanged.</p>
+                <hr style="border-color:rgba(74,144,226,0.2);margin:24px 0"/>
+                <p style="color:#506080;font-size:12px;text-align:center;">© 2026 ChatSpace Pro. All rights reserved.</p>
+              </div>
+            `
+          });
+          console.log(`✅ Password reset email sent to ${email}`);
+        } catch (emailErr) {
+          console.error('Reset email send error:', emailErr.message);
+        }
+        res.json(genericResponse);
+      }
+    );
+  } catch (err) {
+    console.error('Forgot-password error:', err);
+    res.json(genericResponse);
+  }
+});
+
+router.post('/reset-password', async (req, res) => {
+  const { token, dbName, newPassword } = req.body;
+  if (!token || !dbName || !newPassword) return res.status(400).json({ message: 'Token, dbName, and newPassword required' });
+  if (newPassword.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  try {
+    const company = await new Promise((resolve, reject) => {
+      masterDb.query('SELECT db_name FROM companies WHERE db_name=? AND is_active=1', [dbName], (err, rows) => {
+        if (err) return reject(err);
+        resolve(rows.length ? rows[0] : null);
+      });
+    });
+    if (!company) return res.status(400).json({ message: 'Invalid or expired reset link' });
+    const db = getCompanyDb(dbName);
+    db.query(
+      'SELECT * FROM password_reset_tokens WHERE token=? AND used=0 AND expires_at > NOW()',
+      [token],
+      (err, rows) => {
+        if (err) return res.status(500).json({ message: 'Database error' });
+        if (!rows.length) return res.status(400).json({ message: 'This reset link is invalid or has expired. Please request a new one.' });
+        const resetRow = rows[0];
+        const hash = bcrypt.hashSync(newPassword, 10);
+        db.query('UPDATE users SET password=? WHERE id=?', [hash, resetRow.user_id], (err2) => {
+          if (err2) return res.status(500).json({ message: 'Database error: ' + err2.message });
+          db.query('UPDATE password_reset_tokens SET used=1 WHERE id=?', [resetRow.id], () => {
+            console.log(`🔑 Password reset completed for user ${resetRow.user_id} in ${dbName}`);
+            res.json({ message: 'Password reset successful! You can now log in with your new password.' });
+          });
+        });
+      }
+    );
+  } catch (err) {
+    console.error('Reset-password error:', err);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

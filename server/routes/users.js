@@ -23,12 +23,13 @@ const fs = require('fs');
 const { getCompanyDb } = require('../config/db_manager');
 
 // ── AUTH ──
+// FIX: fallback to default db when req.user.dbName is missing (matches messages.js behavior)
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ message: 'No token' });
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
-    if (req.user.dbName) req.db = getCompanyDb(req.user.dbName);
+    req.db = req.user.dbName ? getCompanyDb(req.user.dbName) : require('../config/db');
     next();
   } catch { res.status(401).json({ message: 'Invalid token' }); }
 };
@@ -55,7 +56,6 @@ const avatarUpload = multer({
 
 // ── GET ALL USERS sorted by last message time ──
 router.get('/', auth, (req, res) => {
-  // Try with unread_counts join first, fallback to simple query if table doesn't exist
   req.db.query(
     `SELECT u.id, u.username, u.email, u.avatar_color, u.avatar_url, u.bio, u.status, u.last_seen, u.role, u.user_code,
      COALESCE(uc.last_message_time, 0) as last_message_time,
@@ -68,7 +68,6 @@ router.get('/', auth, (req, res) => {
     [req.user.id, req.user.id, req.user.id],
     (err, rows) => {
       if (err) {
-        // Fallback - simple query without unread_counts
         req.db.query(
           `SELECT u.id, u.username, u.email, u.avatar_color, u.avatar_url, u.bio, u.status, u.last_seen, u.role, u.user_code,
            0 as last_message_time, 0 as unread_count
@@ -103,7 +102,6 @@ router.put('/me', auth, (req, res) => {
   const { username, bio, status } = req.body;
   if (!username?.trim()) return res.status(400).json({ message: 'Username required' });
 
-  // Check username not taken by another user
   req.db.query('SELECT id FROM users WHERE username=? AND id!=?', [username.trim(), req.user.id], (err, rows) => {
     if (err) return res.status(500).json({ message: 'Database error' });
     if (rows.length) return res.status(400).json({ message: 'Username already taken' });
