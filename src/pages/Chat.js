@@ -28,7 +28,6 @@ import {
   Check, User, Save, Settings, Camera
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { useE2EEncryption } from '../hooks/useE2EEncryption';
 import { useTheme } from '../context/ThemeContext';
 import { useToast } from '../context/ToastContext';
 import EmojiPicker from 'emoji-picker-react';
@@ -208,9 +207,6 @@ const ActiveCall = ({ callType, remoteUser, onEnd, localVideoRef, remoteVideoRef
 
 export default function Chat() {
   const { user, logout, updateAvatar, setUser } = useAuth();
-  const e2e = useE2EEncryption(user, axios, API);
-  const groupKeyCacheRef = useRef({});
-  const channelKeyCacheRef = useRef({});
   const { dark, toggle } = useTheme();
   const { addToast } = useToast();
 
@@ -369,14 +365,7 @@ export default function Chat() {
       setLastMessageTimes(prev => ({ ...prev, [`channel_${msg.room}`]: ts }));
       if (!isViewing) addUnread(`channel_${msg.room}`, ts, msg.user_id);
 
-      let displayMsg = msg;
-      if (msg.is_encrypted) {
-        const encKey = channelKeyCacheRef.current[msg.room] || await fetchChannelKey(msg.room);
-        const [decryptedArr] = await Promise.all([
-          e2e.decryptIncoming([msg], { type: 'channel', channelName: msg.room, myEncryptedChannelKey: encKey })
-        ]);
-        displayMsg = decryptedArr[0];
-      }
+      const displayMsg = msg;
 
       if (isViewing) setMessages(prev => prev.find(m=>m.id===displayMsg.id) ? prev : [...prev, displayMsg]);
       if (!isSender) {
@@ -393,13 +382,7 @@ export default function Chat() {
       setLastMessageTimes(prev => ({ ...prev, [`dm_${dmId}`]: ts }));
       if (!isSender && !isViewing) addUnread(`dm_${dmId}`, ts, msg.from_user_id);
 
-      let displayMsg = msg;
-      if (msg.is_encrypted) {
-        const [decryptedArr] = await Promise.all([
-          e2e.decryptIncoming([msg], { type: 'dm', peerId: dmId })
-        ]);
-        displayMsg = decryptedArr[0];
-      }
+      const displayMsg = msg;
 
       if (isViewing || isSender) setMessages(prev => prev.find(m=>m.id===displayMsg.id) ? prev : [...prev, displayMsg]);
       if (!isSender) {
@@ -414,14 +397,7 @@ export default function Chat() {
       const isViewing = activeGroupRef.current && Number(activeGroupRef.current.id) === Number(msg.group_id);
       setLastMessageTimes(prev => ({ ...prev, [`group_${msg.group_id}`]: ts }));
 
-      let displayMsg = msg;
-      if (msg.is_encrypted) {
-        const encKey = groupKeyCacheRef.current[msg.group_id] || await fetchGroupKey(msg.group_id);
-        const [decryptedArr] = await Promise.all([
-          e2e.decryptIncoming([msg], { type: 'group', groupId: msg.group_id, myEncryptedGroupKey: encKey })
-        ]);
-        displayMsg = decryptedArr[0];
-      }
+      const displayMsg = msg; // groups are plaintext — no decryption needed
 
       if (!isSender && !isViewing) {
         addUnread(`group_${msg.group_id}`, ts, msg.user_id);
@@ -627,54 +603,28 @@ export default function Chat() {
     } catch {}
   };
 
-  const fetchGroupKey = async (groupId) => {
-    if (groupKeyCacheRef.current[groupId]) return groupKeyCacheRef.current[groupId];
-    try {
-      const r = await axios.get(`${API}/groups/${groupId}/key`);
-      groupKeyCacheRef.current[groupId] = r.data.encryptedKey;
-      return r.data.encryptedKey;
-    } catch { return null; }
-  };
-
-  const fetchChannelKey = async (channelName) => {
-    if (channelKeyCacheRef.current[channelName]) return channelKeyCacheRef.current[channelName];
-    try {
-      const r = await axios.get(`${API}/messages/channel-key/${channelName}`);
-      channelKeyCacheRef.current[channelName] = r.data.encryptedKey;
-      return r.data.encryptedKey;
-    } catch { return null; }
-  };
-
   const loadMessages = async (type, id, shouldClearUnread = false) => {
     try {
       setMessages([]);
       let r;
-      let context = { type };
 
       if (type==='channel') {
         r = await axios.get(`${API}/messages/${id}`);
         socket.emit('joinRoom', id);
         if (shouldClearUnread) clearUnread(`channel_${id}`);
-        context.channelName = id;
-        context.myEncryptedChannelKey = await fetchChannelKey(id);
       }
       else if (type==='dm') {
         r = await axios.get(`${API}/messages/private/${id}`);
         if (shouldClearUnread) clearUnread(`dm_${id}`);
-        context.peerId = id;
       }
       else {
         r = await axios.get(`${API}/groups/${id}/messages`);
         socket.emit('joinGroup', id);
         if (shouldClearUnread) clearUnread(`group_${id}`);
-        context.groupId = id;
-        context.myEncryptedGroupKey = await fetchGroupKey(id);
       }
 
       const recent = r.data.slice(-100);
-      setMessages(recent.map(m => (m.is_encrypted && m.ciphertext) ? { ...m, text: null, _decrypting: true } : m));
-      const decrypted = await e2e.decryptIncoming(recent, context);
-      setMessages(decrypted);
+      setMessages(recent);
     } catch (err) { console.error('loadMessages error:', err); }
   };
 
@@ -726,26 +676,18 @@ export default function Chat() {
     if (sentKey) setDrafts(prev => ({ ...prev, [sentKey]: '' }));
     try {
       if (activeDM) {
-        const enc = await e2e.encryptOutgoing(text, { type: 'dm', peerId: activeDM.id });
-        const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, ...enc, ...replyData });
+        const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text, ...replyData });
         const finalMsg = { ...r.data, text, ...replyData, avatar_color:user.avatar_color, username:user.username };
         socket.emit('sendPrivateMessage', { ...r.data, ...replyData, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeGroup) {
-        let enc = { text };
-        if (activeGroup.is_encrypted) {
-          const myEncryptedGroupKey = groupKeyCacheRef.current[activeGroup.id] || await fetchGroupKey(activeGroup.id);
-          enc = await e2e.encryptOutgoing(text, { type: 'group', groupId: activeGroup.id, myEncryptedGroupKey });
-        }
-        const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { ...enc, ...replyData });
+        const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text, ...replyData });
         const finalMsg = { ...r.data, text, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username };
         socket.emit('sendGroupMessage', { ...r.data, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
         setMessageReads(prev => ({ ...prev, [finalMsg.id]: [{ userId: user.id, username: user.username, seenAt: new Date() }] }));
       } else if (activeChannel) {
-        const myEncryptedChannelKey = channelKeyCacheRef.current[activeChannel] || await fetchChannelKey(activeChannel);
-        const enc = await e2e.encryptOutgoing(text, { type: 'channel', channelName: activeChannel, myEncryptedChannelKey });
-        const r = await axios.post(`${API}/messages`, { room:activeChannel, ...enc, ...replyData });
+        const r = await axios.post(`${API}/messages`, { room:activeChannel, text, ...replyData });
         const finalMsg = { ...r.data, text, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username };
         socket.emit('sendMessage', { ...r.data, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
@@ -1090,57 +1032,15 @@ export default function Chat() {
       const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
       setGroupMembersList(r.data);
       addToast({ title:'Member added!', message:`${username} added to group` });
-
-      // ── If this group is encrypted, the newly added member has no key
-      // yet. Auto-rotating right now generates a fresh key and shares it
-      // with everyone currently in the group (including the new member),
-      // instead of needing a separate "share key with new member" path. ──
-      if (activeGroup.is_encrypted) {
-        await autoRotateGroupKey(activeGroup.id, r.data);
-      }
     }
     catch (err) { setAdminError(err.response?.data?.message||'Failed to add member'); }
   };
 
-  // ── AUTO KEY ROTATION: shared by add-member and remove-member flows.
-  // Generates a brand new AES key, encrypted individually for every member
-  // currently in the provided list — so a removed member's old key copy
-  // can no longer decrypt anything new, and a newly added member gets a
-  // usable key immediately. Skips (with a toast) if any current member is
-  // missing a public_key, rather than failing the whole operation. ──
-  const autoRotateGroupKey = async (groupId, members) => {
-    try {
-      const missingKey = members.find(m => !m.public_key);
-      if (missingKey) {
-        addToast({ title: 'Key rotation skipped', message: `${missingKey.username} hasn't logged in yet — rotate manually once they have` });
-        return;
-      }
-      const memberPublicKeys = members.map(m => ({ userId: m.id, publicKeyB64: m.public_key }));
-      const { encryptedKeys } = await e2e.createGroupKeys(memberPublicKeys);
-      await axios.post(`${API}/groups/${groupId}/key/rotate`, { memberKeys: encryptedKeys });
-      groupKeyCacheRef.current[groupId] = encryptedKeys.find(k => k.userId === user.id)?.encryptedKey;
-      addToast({ title: '🔐 Encryption key rotated', message: 'Group membership changed — encryption key updated automatically' });
-    } catch (err) {
-      console.error('Auto key rotation failed:', err);
-      addToast({ title: 'Key rotation failed', message: err.response?.data?.message || '' });
-    }
-  };
-
   const handleRemoveMember = async (memberId) => {
     try {
-      const wasEncrypted = activeGroup.is_encrypted;
       await axios.delete(`${API}/groups/${activeGroup.id}/members/${memberId}`);
       const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
       setGroupMembersList(r.data);
-
-      // ── Auto key rotation: the backend's DELETE response flags
-      // keyRotationRecommended:true. We act on it here, scoped to ONLY the
-      // remaining members (r.data, freshly re-fetched after removal), so
-      // the removed member's old key copy is useless for any future
-      // messages — this closes the forward-secrecy gap automatically. ──
-      if (wasEncrypted) {
-        await autoRotateGroupKey(activeGroup.id, r.data);
-      }
     }
     catch (err) { setAdminError(err.response?.data?.message||'Failed'); }
   };
@@ -1163,47 +1063,6 @@ export default function Chat() {
     catch (err) {
       console.error('Make admin error:', err.response?.data || err.message);
       setAdminError(err.response?.data?.message || 'Failed to transfer admin');
-    }
-  };
-
-  const [enablingEncryption, setEnablingEncryption] = useState(false);
-  const handleEnableGroupEncryption = async () => {
-    if (!activeGroup) return;
-    setEnablingEncryption(true);
-    try {
-      const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
-      const members = r.data;
-      const missingKey = members.find(m => !m.public_key);
-      if (missingKey) {
-        addToast({ title:'Cannot enable yet', message:`${missingKey.username} hasn't logged in since encryption was added` });
-        setEnablingEncryption(false);
-        return;
-      }
-      const memberPublicKeys = members.map(m => ({ userId: m.id, publicKeyB64: m.public_key }));
-      const { encryptedKeys } = await e2e.createGroupKeys(memberPublicKeys);
-      await axios.post(`${API}/groups/${activeGroup.id}/key/rotate`, { memberKeys: encryptedKeys });
-      groupKeyCacheRef.current[activeGroup.id] = encryptedKeys.find(k => k.userId === user.id)?.encryptedKey;
-      setActiveGroup(prev => ({ ...prev, is_encrypted: 1 }));
-      setGroups(prev => prev.map(g => g.id === activeGroup.id ? { ...g, is_encrypted: 1 } : g));
-      addToast({ title:'🔐 Encryption enabled!', message:'New messages in this group are now end-to-end encrypted' });
-    } catch (err) {
-      console.error('Enable group encryption failed:', err);
-      addToast({ title:'Failed to enable encryption', message: err.response?.data?.message || '' });
-    } finally {
-      setEnablingEncryption(false);
-    }
-  };
-
-  const handleDisableGroupEncryption = async () => {
-    if (!activeGroup) return;
-    if (!window.confirm('Turn off encryption for this group? New messages will no longer be encrypted. Old encrypted messages stay as they are and remain readable to members who already have the key.')) return;
-    try {
-      await axios.put(`${API}/groups/${activeGroup.id}/encryption/disable`);
-      setActiveGroup(prev => ({ ...prev, is_encrypted: 0 }));
-      setGroups(prev => prev.map(g => g.id === activeGroup.id ? { ...g, is_encrypted: 0 } : g));
-      addToast({ title: '🔓 Encryption turned off', message: 'New messages in this group will be sent as plaintext' });
-    } catch (err) {
-      addToast({ title: 'Failed to disable encryption', message: err.response?.data?.message || '' });
     }
   };
 
@@ -1352,12 +1211,7 @@ export default function Chat() {
                 <div style={{ fontSize:11, color:'rgba(180,200,255,0.8)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:200 }}>{msg.reply_to_text}</div>
               </div>
             )}
-            {msg._decrypting ? (
-              <p className="text-xs italic flex items-center gap-1.5" style={{ color:'rgba(150,180,255,0.5)' }}>
-                <span style={{ width:8, height:8, borderRadius:'50%', background:'currentColor', display:'inline-block', animation:'pulseGlow 1.2s ease-in-out infinite' }}/>
-                Decrypting…
-              </p>
-            ) : isDeleted ? (
+            {isDeleted ? (
               <p className="text-xs italic" style={{ color:'rgba(150,180,255,0.4)' }}>🚫 This message was deleted</p>
             ) : imageMatch ? (
               <img src={imageUrl2} alt="shared"
@@ -1623,7 +1477,6 @@ export default function Chat() {
                   style={{ color: activeGroup?.id===g.id ? '#4A90E2' : 'rgba(150,180,255,0.65)', background: activeGroup?.id===g.id ? 'rgba(74,144,226,0.12)' : 'transparent' }}>
                   <Users size={14} style={{ flexShrink:0 }}/>
                   <span className="truncate flex-1">{g.name}</span>
-                  {!!g.is_encrypted && <span title="End-to-end encrypted" style={{ fontSize:11, flexShrink:0 }}>🔐</span>}
                   {g.admin_id===user.id && <span className="text-xs" style={{ color:'#f59e0b' }}>★</span>}
                   <UnreadBadge count={unreadCounts[`group_${g.id}`]} />
                 </button>
@@ -1715,9 +1568,6 @@ export default function Chat() {
             <div className="flex items-center gap-2">
               <h2 className={`font-bold text-sm text-white flex items-center gap-1.5 ${activeDM ? 'cursor-pointer hover:underline' : ''}`} onClick={()=>{ if (activeDM) setViewingProfile(activeDM); }}>
                 {getChatTitle()}
-                {activeGroup && activeGroup.is_encrypted ? (
-                  <span title="End-to-end encrypted" style={{ fontSize:11 }}>🔐</span>
-                ) : null}
               </h2>
               {activeDM && <span className="text-xs px-1.5 py-0.5 rounded-md font-mono" style={{ background:'rgba(74,144,226,0.15)', color:'rgba(100,160,255,0.8)', border:'1px solid rgba(74,144,226,0.2)' }}>{formatUID(activeDM.id)}</span>}
             </div>
@@ -2118,7 +1968,6 @@ export default function Chat() {
             ) : (
               <h2 className="text-lg font-bold text-white mb-5 flex items-center gap-2">
                 <Users size={19} style={{ color:'#4A90E2' }}/> {activeGroup.name}
-                {activeGroup.is_encrypted ? <span title="End-to-end encrypted" style={{ fontSize:13 }}>🔐</span> : null}
                 {activeGroup.admin_id===user.id && (
                   <button onClick={()=>{ setGroupNameInput(activeGroup.name); setEditingGroupName(true); }}
                     className="p-1 rounded-lg transition-all hover:scale-110" style={{ color:'rgba(150,180,255,0.5)' }} title="Rename group">
@@ -2205,21 +2054,6 @@ export default function Chat() {
                 </div>
               ))}
             </div>
-
-            {activeGroup.admin_id===user.id && !activeGroup.is_encrypted && (
-              <button onClick={handleEnableGroupEncryption} disabled={enablingEncryption}
-                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102"
-                style={{ background:'rgba(34,197,94,0.1)', border:'1px solid rgba(34,197,94,0.25)', color:'#22c55e', opacity: enablingEncryption?0.6:1 }}>
-                🔐 {enablingEncryption ? 'Enabling…' : 'Enable End-to-End Encryption'}
-              </button>
-            )}
-            {activeGroup.admin_id===user.id && !!activeGroup.is_encrypted && (
-              <button onClick={handleDisableGroupEncryption}
-                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102"
-                style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}>
-                🔓 Disable End-to-End Encryption
-              </button>
-            )}
 
             {activeGroup.admin_id!==user.id ? (
               <button onClick={handleLeaveGroup} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm mb-2 transition-all hover:scale-102" style={{ background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.25)', color:'#ef4444' }}>

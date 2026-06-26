@@ -87,7 +87,6 @@ router.post('/login', async (req, res) => {
           companyCode: parsed.code,
           companyName: company.name,
           dbName: company.db_name,
-          hasPublicKey: !!user.public_key,
         }
       });
     });
@@ -139,7 +138,7 @@ router.post('/send-code', async (req, res) => {
 
 // ── REGISTER ──
 router.post('/register', async (req, res) => {
-  const { email, password, username, companyCode, avatar_color, publicKey } = req.body;
+  const { email, password, username, companyCode, avatar_color } = req.body;
   if (!email || !password || !companyCode) return res.status(400).json({ message: 'All fields required' });
   try {
     const company = await getCompanyByCode(companyCode);
@@ -158,8 +157,8 @@ router.post('/register', async (req, res) => {
           const hash = bcrypt.hashSync(password, 10);
           const isFirstUser = countRows[0].count === 0;
           db.query(
-            'INSERT INTO users (email, password, username, avatar_color, role, public_key) VALUES (?,?,?,?,?,?)',
-            [email, hash, finalUsername, avatar_color || '#4A90E2', isFirstUser ? 'admin' : 'member', publicKey || null],
+            'INSERT INTO users (email, password, username, avatar_color, role) VALUES (?,?,?,?,?)',
+            [email, hash, finalUsername, avatar_color || '#4A90E2', isFirstUser ? 'admin' : 'member'],
             (err, result) => {
               if (err) return res.status(500).json({ message: 'Database error' });
               const userId = generateUserId(companyCode, result.insertId);
@@ -203,7 +202,6 @@ router.post('/register', async (req, res) => {
                   companyCode,
                   companyName: company.name,
                   dbName: company.db_name,
-                  hasPublicKey: !!publicKey,
                 }
               });
             }
@@ -214,41 +212,6 @@ router.post('/register', async (req, res) => {
   } catch (err) {
     console.error('Register error:', err);
     res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ── E2E ENCRYPTION: SAVE/UPDATE MY PUBLIC KEY ──
-router.post('/save-public-key', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ message: 'No token' });
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const { publicKey } = req.body;
-    if (!publicKey) return res.status(400).json({ message: 'publicKey required' });
-    const db = decoded.dbName ? getCompanyDb(decoded.dbName) : require('../config/db');
-    db.query('UPDATE users SET public_key=? WHERE id=?', [publicKey, decoded.id], (err) => {
-      if (err) return res.status(500).json({ message: 'Database error' });
-      res.json({ message: 'Public key saved' });
-    });
-  } catch (err) {
-    res.status(401).json({ message: 'Invalid token' });
-  }
-});
-
-// ── E2E ENCRYPTION: GET SOMEONE'S PUBLIC KEY ──
-router.get('/public-key/:userId', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ message: 'No token' });
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const db = decoded.dbName ? getCompanyDb(decoded.dbName) : require('../config/db');
-    db.query('SELECT public_key FROM users WHERE id=?', [req.params.userId], (err, rows) => {
-      if (err) return res.status(500).json({ message: 'Database error' });
-      if (!rows.length) return res.status(404).json({ message: 'User not found' });
-      res.json({ publicKey: rows[0].public_key });
-    });
-  } catch (err) {
-    res.status(401).json({ message: 'Invalid token' });
   }
 });
 

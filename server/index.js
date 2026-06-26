@@ -157,6 +157,7 @@ io.on('connection', (socket) => {
       io.emit('groupDeleted', { groupId });
     }
   });
+
   socket.on('deleteMessage', (data) => io.emit('messageDeleted', data));
   socket.on('messageSeen', (data) => io.emit('messageSeen', data));
 
