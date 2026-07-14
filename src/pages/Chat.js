@@ -32,7 +32,7 @@ import { useTheme } from '../context/ThemeContext';
 import { useToast } from '../context/ToastContext';
 import EmojiPicker from 'emoji-picker-react';
 
-const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
+const API = 'https://resume-embezzle-overbill.ngrok-free.dev/api';
 const formatUID = (id) => {
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const letterIndex = Math.floor((id - 1) / 9999) % 26;
@@ -91,7 +91,7 @@ const Avatar = ({ user, size = 38, showStatus = false }) => {
   return (
     <div className="relative flex-shrink-0" style={{ width: size, height: size }}>
       {user?.avatar_url ? (
-        <img src={`https://gong-unbend-chief.ngrok-free.dev${user.avatar_url}`} alt=""
+        <img src={`https://resume-embezzle-overbill.ngrok-free.dev${user.avatar_url}`} alt=""
           className="rounded-full object-cover w-full h-full avatar-ring" />
       ) : (
         <div className="rounded-full flex items-center justify-center text-white font-bold w-full h-full"
@@ -272,7 +272,6 @@ export default function Chat() {
   const [lastMessageTimes, setLastMessageTimes] = useState({});
   const [imageViewer, setImageViewer] = useState(null);
 
-  // ── GROUP READ RECEIPTS ──
   const [messageReads, setMessageReads] = useState({});
   const [readReceiptPopup, setReadReceiptPopup] = useState(null);
 
@@ -292,6 +291,12 @@ export default function Chat() {
   const userIdRef = useRef(user?.id);
   const unreadCountsRef = useRef({});
   const lastMessageTimesRef = useRef({});
+  const groupsRef = useRef(groups);
+  const hasConnectedBeforeRef = useRef(false);
+  const lastResyncRef = useRef(0);
+  const otherPartySocketRef = useRef(null);
+  const pendingOutgoingCallRef = useRef(null); // { toUserId, callType } while WE are calling someone who hasn't answered yet
+  const callConnectedRef = useRef(false); // true once the other side actually answers
   const rtcConfig = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -307,6 +312,9 @@ export default function Chat() {
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
     if (peerConnectionRef.current) { peerConnectionRef.current.close(); peerConnectionRef.current = null; }
     clearTimeout(missedCallTimerRef.current);
+    otherPartySocketRef.current = null;
+    pendingOutgoingCallRef.current = null;
+    callConnectedRef.current = false;
     setActiveCall(null); setIncomingCall(null); setCallLoading(false);
   }, []);
 
@@ -314,10 +322,14 @@ export default function Chat() {
     const text = callType==='video' ? '📹 Missed video call' : '📞 Missed voice call';
     try {
       const r = await axios.post(`${API}/messages/private`, { to_user_id: toUserId, text });
-      socket.emit('sendPrivateMessage', { ...r.data, avatar_color: user.avatar_color });
-      setMessages(prev => [...prev, { ...r.data, username: user.username, avatar_color: user.avatar_color }]);
-    } catch {}
-  }, [user]);
+      const finalMsg = { ...r.data, text, username: user.username, avatar_color: user.avatar_color };
+      socket.emit('sendPrivateMessage', { ...finalMsg, to_user_id: toUserId });
+      setMessages(prev => [...prev, finalMsg]);
+    } catch (err) {
+      console.error('Failed to save missed call message:', err.response?.data || err.message);
+      addToast({ title:'Missed call not saved', message: err.response?.data?.message || 'Could not save missed call message' });
+    }
+  }, [user, addToast]);
 
   useEffect(() => {
     if ('Notification' in window && Notification.permission==='default') Notification.requestPermission();
@@ -336,11 +348,46 @@ export default function Chat() {
   };
 
   useEffect(() => {
-    socket = io('https://gong-unbend-chief.ngrok-free.dev');
-    socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
-    setTimeout(() => {
-      if (groups.length > 0) groups.forEach(g => socket.emit('joinGroup', g.id));
-    }, 1000);
+    socket = io('https://resume-embezzle-overbill.ngrok-free.dev', {
+      transportOptions: {
+        polling: {
+          extraHeaders: {
+            'ngrok-skip-browser-warning': 'true'
+          }
+        }
+      }
+    });
+    const registerOnline = () => {
+      socket.emit('userOnline', { id:user.id, username:user.username, avatar_color:user.avatar_color, avatar_url:user.avatar_url, status:user.status||'online' });
+      ['announcements', 'tech-updates', 'job-notifications'].forEach(ch => socket.emit('joinRoom', ch));
+      if (groupsRef.current.length > 0) groupsRef.current.forEach(g => socket.emit('joinGroup', g.id));
+      if (hasConnectedBeforeRef.current) {
+        // This is a RECONNECT, not the initial page load. The socket may
+        // have been disconnected briefly (ngrok tunnel blip, network
+        // hiccup, etc), and any messages sent to us during that gap were
+        // saved to the DB but never arrived live. Merge in anything we're
+        // missing for the currently open conversation — WITHOUT clearing
+        // what's already on screen, since on an unstable connection that
+        // can reconnect repeatedly, wiping the list each time can make it
+        // look like messages never arrive at all.
+        const now = Date.now();
+        if (now - lastResyncRef.current > 2000) {
+          lastResyncRef.current = now;
+          console.log('🔄 Reconnected — resyncing current conversation');
+          if (activeDMRef.current) resyncMessages('dm', activeDMRef.current.id);
+          else if (activeGroupRef.current) resyncMessages('group', activeGroupRef.current.id);
+          else if (activeChannelRef.current) resyncMessages('channel', activeChannelRef.current);
+          loadUnreadCounts();
+        }
+      }
+      hasConnectedBeforeRef.current = true;
+    };
+    // 'connect' fires on the initial connection AND every time socket.io
+    // auto-reconnects after a dropped connection (network blip, ngrok tunnel
+    // restart, etc). Without re-registering here, a reconnected user stops
+    // showing up as "online" to others, and calls/messages to them silently
+    // fail to route even though their tab looks perfectly normal.
+    socket.on('connect', registerOnline);
     socket.on('onlineUsers', setOnlineUsers);
     socket.on('groupCreated', () => loadGroups());
     socket.on('roleUpdated', ({ userId, role }) => {
@@ -359,6 +406,7 @@ export default function Chat() {
       if (activeGroup?.id === groupId) { setActiveGroup(null); setMessages([]); }
     });
     socket.on('newMessage', async msg => {
+      console.log(`📩 [client] newMessage received in room "${msg.room}" (currently viewing: "${activeChannelRef.current}")`, msg);
       const ts = Date.now();
       const isSender = Number(msg.user_id) === Number(userIdRef.current);
       const isViewing = msg.room === activeChannelRef.current;
@@ -375,6 +423,7 @@ export default function Chat() {
     });
 
     socket.on('newPrivateMessage', async msg => {
+      console.log(`📩 [client] newPrivateMessage received from ${msg.from_user_id} to ${msg.to_user_id} (currently viewing DM: ${activeDMRef.current?.id})`, msg);
       const ts = Date.now();
       const isSender = Number(msg.from_user_id) === Number(userIdRef.current);
       const dmId = isSender ? msg.to_user_id : msg.from_user_id;
@@ -392,12 +441,13 @@ export default function Chat() {
     });
 
     socket.on('newGroupMessage', async msg => {
+      console.log(`📩 [client] newGroupMessage received in group ${msg.group_id} (currently viewing group: ${activeGroupRef.current?.id})`, msg);
       const ts = Date.now();
       const isSender = Number(msg.user_id) === Number(userIdRef.current);
       const isViewing = activeGroupRef.current && Number(activeGroupRef.current.id) === Number(msg.group_id);
       setLastMessageTimes(prev => ({ ...prev, [`group_${msg.group_id}`]: ts }));
 
-      const displayMsg = msg; // groups are plaintext — no decryption needed
+      const displayMsg = msg;
 
       if (!isSender && !isViewing) {
         addUnread(`group_${msg.group_id}`, ts, msg.user_id);
@@ -426,6 +476,7 @@ export default function Chat() {
     socket.on('messageDeleted', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text:'This message was deleted',deleted:1}:m)); });
     socket.on('messageSeen', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,seen_at:new Date()}:m)); });
     socket.on('groupMessageSeen', ({ messageId, userId, username }) => {
+      console.log(`👀 [client] received groupMessageSeen: msg ${messageId} seen by ${username} (user ${userId})`);
       setMessageReads(prev => {
         const existing = prev[messageId] || [];
         if (existing.find(r => r.userId === userId)) return prev;
@@ -436,19 +487,34 @@ export default function Chat() {
       setIncomingCall({ from, fromUser, callType, offer });
       missedCallTimerRef.current = setTimeout(() => { socket.emit('rejectCall', { to:from, toUserId:fromUser.id, fromUser:user }); setIncomingCall(null); }, 30000);
     });
-    socket.on('callAccepted', async ({ answer }) => { if (peerConnectionRef.current) { await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer)); setCallLoading(false); } });
-    socket.on('callRejected', () => { cleanupCall(); addToast({ title:'Call declined', message:'The user rejected your call' }); });
+    socket.on('callAccepted', async ({ answer }) => { if (peerConnectionRef.current) { await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer)); callConnectedRef.current = true; setCallLoading(false); } });
+    socket.on('callRejected', () => {
+      // Call was declined before it ever connected — log it as a missed call
+      // so it shows up in the chat, same as a timed-out or cancelled call.
+      if (pendingOutgoingCallRef.current) {
+        const { toUserId, callType } = pendingOutgoingCallRef.current;
+        sendMissedCallMessage(toUserId, callType);
+      }
+      cleanupCall();
+      addToast({ title:'Call declined', message:'The user rejected your call' });
+    });
     socket.on('callEnded', () => { cleanupCall(); });
     socket.on('iceCandidate', async ({ candidate }) => { if (peerConnectionRef.current && candidate) { try { await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch {} } });
-    socket.on('missedCallMessage', async ({ fromUser }) => {
-      try { const r = await axios.post(`${API}/messages/private`, { to_user_id:fromUser.id, text:'📞 Missed voice call' }); setMessages(prev => [...prev, { ...r.data, username:user.username, avatar_color:user.avatar_color }]); } catch {}
+    socket.on('missedCallMessage', ({ fromUser, callType }) => {
+      // The caller already persisted the single canonical "missed call" DB
+      // message and broadcast it via newPrivateMessage — this just notifies
+      // us in realtime. We do NOT create another DB row here, since that
+      // previously wrote a duplicate, backwards message (from us to them).
+      addToast({
+        title: 'Missed call',
+        message: `${fromUser?.username || 'Someone'} tried to reach you (${callType==='video' ? 'video' : 'voice'} call)`,
+        avatar: { color: fromUser?.avatar_color, letter: fromUser?.username?.[0]?.toUpperCase() }
+      });
+      showPushNotif(fromUser?.username || 'Missed call', callType==='video' ? '📹 Missed video call' : '📞 Missed voice call');
     });
     loadUsers(); loadGroups(); loadMessages('channel', 'announcements', false);
     loadUnreadCounts();
     setTimeout(() => loadUnreadCounts(), 2000);
-    ['announcements', 'tech-updates', 'job-notifications'].forEach(ch => {
-      socket.emit('joinRoom', ch);
-    });
     if (user.role !== 'admin') {
       axios.get(`${API}/admin/can-post/announcements`).then(r => setCanPost(r.data.canPost)).catch(() => {});
     } else {
@@ -471,6 +537,7 @@ export default function Chat() {
   useEffect(() => { userIdRef.current = user?.id; }, [user]);
   useEffect(() => { unreadCountsRef.current = unreadCounts; }, [unreadCounts]);
   useEffect(() => { lastMessageTimesRef.current = lastMessageTimes; }, [lastMessageTimes]);
+  useEffect(() => { groupsRef.current = groups; }, [groups]);
 
   useEffect(() => {
     if (activeDM) {
@@ -480,8 +547,6 @@ export default function Chat() {
     }
   }, [messages, activeDM]);
 
-  // ── GROUP READ RECEIPTS: when a group is open, mark visible messages as
-  // seen (bulk) and fetch read status for MY OWN messages only. ──
   useEffect(() => {
     if (!activeGroup || !messages.length) return;
     const messageIds = messages.filter(m => !m.deleted).map(m => m.id);
@@ -628,6 +693,29 @@ export default function Chat() {
     } catch (err) { console.error('loadMessages error:', err); }
   };
 
+  // Same data source as loadMessages, but merges the result into whatever's
+  // already on screen instead of clearing it first. Used after a socket
+  // reconnect to catch up on anything missed while briefly disconnected,
+  // without causing the message list to flicker empty — important on an
+  // unstable connection that might reconnect several times in a row.
+  const resyncMessages = async (type, id) => {
+    try {
+      let r;
+      if (type === 'channel') r = await axios.get(`${API}/messages/${id}`);
+      else if (type === 'dm') r = await axios.get(`${API}/messages/private/${id}`);
+      else r = await axios.get(`${API}/groups/${id}/messages`);
+      const fresh = r.data.slice(-100);
+      setMessages(prev => {
+        const existingIds = new Set(prev.map(m => m.id));
+        const merged = [...prev, ...fresh.filter(m => !existingIds.has(m.id))];
+        merged.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        return merged;
+      });
+    } catch (err) {
+      console.error('resyncMessages error:', err);
+    }
+  };
+
   const switchChannel = async ch => {
     setTypingUsers([]);
     setViewingProfile(null);
@@ -678,17 +766,20 @@ export default function Chat() {
       if (activeDM) {
         const r = await axios.post(`${API}/messages/private`, { to_user_id:activeDM.id, text, ...replyData });
         const finalMsg = { ...r.data, text, ...replyData, avatar_color:user.avatar_color, username:user.username };
-        socket.emit('sendPrivateMessage', { ...r.data, ...replyData, avatar_color:user.avatar_color, username:user.username });
+        console.log(`📤 [client] emitting sendPrivateMessage to user ${activeDM.id}, socket connected: ${socket.connected}`);
+        socket.emit('sendPrivateMessage', { ...r.data, ...replyData, to_user_id:activeDM.id, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
       } else if (activeGroup) {
         const r = await axios.post(`${API}/groups/${activeGroup.id}/messages`, { text, ...replyData });
         const finalMsg = { ...r.data, text, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username };
+        console.log(`📤 [client] emitting sendGroupMessage to group ${activeGroup.id}, socket connected: ${socket.connected}`);
         socket.emit('sendGroupMessage', { ...r.data, ...replyData, group_id: activeGroup.id, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
         setMessageReads(prev => ({ ...prev, [finalMsg.id]: [{ userId: user.id, username: user.username, seenAt: new Date() }] }));
       } else if (activeChannel) {
         const r = await axios.post(`${API}/messages`, { room:activeChannel, text, ...replyData });
         const finalMsg = { ...r.data, text, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username };
+        console.log(`📤 [client] emitting sendMessage to room "${activeChannel}", socket connected: ${socket.connected}`);
         socket.emit('sendMessage', { ...r.data, ...replyData, room:activeChannel, avatar_color:user.avatar_color, username:user.username });
         setMessages(prev => [...prev, finalMsg]);
       }
@@ -732,7 +823,7 @@ export default function Chat() {
       });
       setIsUploading(false);
       setUploadProgress(0);
-      const baseUrl = window.location.origin.includes('localhost') ? 'https://gong-unbend-chief.ngrok-free.dev' : window.location.origin;
+      const baseUrl = window.location.origin.includes('localhost') ? 'https://resume-embezzle-overbill.ngrok-free.dev' : window.location.origin;
       const fileUrl = `${baseUrl}${r.data.file_url}`;
       const text = `[FILE]${JSON.stringify({ url: fileUrl, name: r.data.file_name, size: r.data.file_size, type: r.data.file_type })}[/FILE]`;
 
@@ -765,7 +856,7 @@ export default function Chat() {
       const fd = new FormData();
       fd.append('image', file);
       const r = await axios.post(`${API}/messages/upload-image`, fd);
-      const imageUrl = `https://gong-unbend-chief.ngrok-free.dev${r.data.image_url}`;
+      const imageUrl = `https://resume-embezzle-overbill.ngrok-free.dev${r.data.image_url}`;
       const text = `[IMAGE]${imageUrl}[/IMAGE]`;
 
       if (activeDM) {
@@ -817,7 +908,7 @@ export default function Chat() {
     if (!forwardMsg) return;
     try {
       const r = await axios.post(`${API}/messages/private`, { to_user_id:targetUserId, text:`↩ Forwarded: ${forwardMsg.text}` });
-      socket.emit('sendPrivateMessage', { ...r.data, avatar_color:user.avatar_color });
+      socket.emit('sendPrivateMessage', { ...r.data, to_user_id:targetUserId, avatar_color:user.avatar_color });
       addToast({ title:'Message forwarded!', message:'' });
     } catch {}
     setForwardMsg(null);
@@ -857,7 +948,10 @@ export default function Chat() {
   };
 
   const startCall = async (callType) => {
-    if (!activeDM) return;
+    if (!activeDM) {
+      if (activeGroup) addToast({ title:'Not supported yet', message:'Group calls are not available yet — call members individually for now' });
+      return;
+    }
     setCallLoading(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia(callType==='video'?{video:true,audio:true}:{audio:true});
@@ -871,14 +965,30 @@ export default function Chat() {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       const toUser = onlineUsers.find(u=>u.id===activeDM.id);
-      if (!toUser) { await sendMissedCallMessage(activeDM.id, callType); cleanupCall(); return; }
+      if (!toUser) {
+        console.warn(`Call target user ${activeDM.id} is not in the online users list — sending missed call instead`);
+        await sendMissedCallMessage(activeDM.id, callType);
+        cleanupCall();
+        return;
+      }
       activeDM._socketId = toUser.socketId;
+      otherPartySocketRef.current = toUser.socketId;
+      pendingOutgoingCallRef.current = { toUserId: activeDM.id, callType };
+      callConnectedRef.current = false;
       socket.emit('callUser', { toUserId:activeDM.id, callType, fromUser:{ id:user.id, username:user.username, avatar_color:user.avatar_color }, offer });
       setActiveCall({ callType, remoteUser:activeDM });
       missedCallTimerRef.current = setTimeout(async () => {
-        if (peerConnectionRef.current) { socket.emit('missedCall', { to:toUser.socketId, fromUser:user }); await sendMissedCallMessage(activeDM.id, callType); cleanupCall(); }
+        if (peerConnectionRef.current) {
+          socket.emit('missedCall', { to:toUser.socketId, fromUser:user, callType });
+          await sendMissedCallMessage(activeDM.id, callType);
+          cleanupCall();
+        }
       }, 30000);
-    } catch { cleanupCall(); addToast({ title:'Call failed', message:'Could not access camera/microphone' }); }
+    } catch (err) {
+      console.error('startCall error:', err);
+      cleanupCall();
+      addToast({ title:'Call failed', message:'Could not access camera/microphone' });
+    }
   };
 
   const acceptCall = async () => {
@@ -897,9 +1007,13 @@ export default function Chat() {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('acceptCall', { to:incomingCall.from, answer });
+      otherPartySocketRef.current = incomingCall.from;
       setActiveCall({ callType:incomingCall.callType, remoteUser:incomingCall.fromUser });
       setIncomingCall(null);
-    } catch { cleanupCall(); }
+    } catch (err) {
+      console.error('acceptCall error:', err);
+      cleanupCall();
+    }
   };
 
   const rejectCall = () => {
@@ -908,7 +1022,17 @@ export default function Chat() {
     setIncomingCall(null);
   };
 
-  const endCall = () => { if (activeCall) socket.emit('callEnded', { to:activeDM?._socketId||'' }); cleanupCall(); };
+  const endCall = () => {
+    if (activeCall && otherPartySocketRef.current) socket.emit('callEnded', { to: otherPartySocketRef.current });
+    // If we were the caller and hung up before the other person ever
+    // answered, this is a cancelled/missed call — log it just like a
+    // timed-out or rejected call, instead of silently discarding it.
+    if (!callConnectedRef.current && pendingOutgoingCallRef.current) {
+      const { toUserId, callType } = pendingOutgoingCallRef.current;
+      sendMissedCallMessage(toUserId, callType);
+    }
+    cleanupCall();
+  };
 
   const toggleScreenShare = async () => {
     if (screenSharing) {
@@ -1142,7 +1266,6 @@ export default function Chat() {
     );
   };
 
-  // ── GROUP READ RECEIPTS: small "Seen by X of Y" text under own group messages ──
   const GroupReadReceipt = ({ msg }) => {
     if (!activeGroup) return null;
     const reads = messageReads[msg.id] || [];
@@ -1164,7 +1287,7 @@ export default function Chat() {
     const isOwn = msg.user_id===user.id || msg.from_user_id===user.id;
     const isDeleted2 = msg.deleted === 1 || msg.text === 'This message was deleted';
     const imageMatch = !isDeleted2 && msg.text?.match(/\[IMAGE\](.*?)\[\/IMAGE\]/);
-    const imageUrl2 = imageMatch ? imageMatch[1].replace('http://localhost:5000', window.location.origin.includes('localhost') ? 'http://localhost:5000' : window.location.origin).replace(/https:\/\/[a-z0-9-]+\.ngrok-free\.(app|dev)/, window.location.origin.includes('localhost') ? 'https://gong-unbend-chief.ngrok-free.dev' : window.location.origin) : null;
+    const imageUrl2 = imageMatch ? imageMatch[1].replace('https://resume-embezzle-overbill.ngrok-free.dev', window.location.origin.includes('localhost') ? 'https://resume-embezzle-overbill.ngrok-free.dev' : window.location.origin).replace(/https:\/\/[a-z0-9-]+\.ngrok-free\.(app|dev)/, window.location.origin.includes('localhost') ? 'https://resume-embezzle-overbill.ngrok-free.dev' : window.location.origin) : null;
     const fileMatch = !isDeleted2 && msg.text?.match(/\[FILE\](.*?)\[\/FILE\]/);
     const fileData = fileMatch ? (() => { try { return JSON.parse(fileMatch[1]); } catch { return null; } })() : null;
     const isMissedCall = msg.deleted!==1 && msg.text && (msg.text.includes('Missed')||msg.text.includes('missed')) && (msg.text.includes('📞')||msg.text.includes('📹'));
@@ -2179,7 +2302,7 @@ export default function Chat() {
             </div>
             <div className="flex flex-col items-center gap-3 mb-5">
               <button
-                onClick={()=>{ if (viewingProfile.avatar_url) setImageViewer({ src:`https://gong-unbend-chief.ngrok-free.dev${viewingProfile.avatar_url}`, hideDownload:true }); }}
+                onClick={()=>{ if (viewingProfile.avatar_url) setImageViewer({ src:`https://resume-embezzle-overbill.ngrok-free.dev${viewingProfile.avatar_url}`, hideDownload:true }); }}
                 className={viewingProfile.avatar_url ? 'cursor-pointer hover:scale-105 transition-transform' : 'cursor-default'}
                 title={viewingProfile.avatar_url ? 'View full photo' : ''}>
                 <Avatar user={viewingProfile} size={88} showStatus />

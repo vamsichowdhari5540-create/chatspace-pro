@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
-const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
+const API = 'https://resume-embezzle-overbill.ngrok-free.dev/api';
+axios.defaults.headers.common['ngrok-skip-browser-warning'] = 'true';
 const AuthContext = createContext();
 
 // Set axios default auth header
@@ -50,11 +51,14 @@ export const AuthProvider = ({ children }) => {
     if (token && savedUser) {
       setAuthHeader(token);
       axios.get(`${API}/users/me`)
-        .then(() => {
-          // Token still valid — trust the cached user object for display,
-          // but refresh it from the server response to catch any profile
-          // changes made elsewhere (role updates, etc.) since last login.
-          setUser(JSON.parse(savedUser));
+        .then((r) => {
+          // Token still valid — use the FRESH server data (not the stale
+          // cached copy), so role changes and other profile updates made
+          // elsewhere (e.g. by an admin) are reflected immediately on load
+          // instead of silently reverting to whatever was cached at login.
+          const freshUser = { ...JSON.parse(savedUser), ...r.data };
+          localStorage.setItem('user', JSON.stringify(freshUser));
+          setUser(freshUser);
         })
         .catch((err) => {
           if (err.response?.status === 401) {

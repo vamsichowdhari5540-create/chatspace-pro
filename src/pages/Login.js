@@ -6,7 +6,7 @@ import Globe from 'react-globe.gl';
 import axios from 'axios';
 axios.defaults.headers.common['ngrok-skip-browser-warning'] = 'true';
 
-const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
+const API = 'https://resume-embezzle-overbill.ngrok-free.dev/api';
 
 const ARCS = [
   { startLat:51.5,startLng:-0.1,endLat:40.7,endLng:-74.0 },
@@ -94,11 +94,6 @@ const ForgotModal = ({ onClose }) => {
     gsap.to(overlayRef.current, { opacity:0, duration:0.3, onComplete:onClose });
   };
 
-  // ── WIRED UP: actually calls the backend instead of just simulating success.
-  // The backend always responds with a generic success message whether or not
-  // the email exists, so this UI always shows the "Check your inbox" screen too
-  // — that's intentional, it prevents this form from being used to check which
-  // emails are registered in the system.
   const handleSend = async (e) => {
     e.preventDefault();
     if (!email) { setError('Please enter your email'); return; }
@@ -255,7 +250,7 @@ export default function Login() {
   useEffect(() => {
     const match = userId?.match(/^CSP-([A-Z0-9]+)-/i);
     if (match) {
-      axios.get(`https://gong-unbend-chief.ngrok-free.dev/api/auth/company/${match[1]}`)
+      axios.get(`https://resume-embezzle-overbill.ngrok-free.dev/api/auth/company/${match[1]}`)
         .then(r => setCompanyName(r.data.name))
         .catch(() => setCompanyName(''));
     } else {
@@ -269,7 +264,7 @@ export default function Login() {
     if (!userId || !password) { setError('All fields required'); return; }
     setError(''); setLoading(true);
     try {
-      await axios.post('https://gong-unbend-chief.ngrok-free.dev/api/auth/login', { userId, password });
+      await axios.post('https://resume-embezzle-overbill.ngrok-free.dev/api/auth/login', { userId, password });
       setAccessStatus('granted');
     } catch (err) {
       setAccessStatus('denied');
@@ -406,15 +401,23 @@ export default function Login() {
           if (accessStatus==='granted') {
             setAccessStatus(null);
             try { await login(userId, password); } catch(e) {}
-            gsap.to(panelRef.current, { opacity:0, x:70, duration:0.9, ease:'power2.in',
-              onComplete: () => {
-                gsap.to(earthRef.current, { x:'0vw', scale:0.65, opacity:0.2, duration:2.8, ease:'power3.inOut' });
-                gsap.set(welcomeRef.current, { visibility:'visible' });
-                gsap.to(welcomeRef.current, { opacity:1, scale:1, duration:1.8, ease:'power2.out', delay:1,
-                  onComplete: () => navigate('/chat')
-                });
-              }
-            });
+            if (panelRef.current) {
+              gsap.to(panelRef.current, { opacity:0, x:70, duration:0.9, ease:'power2.in',
+                onComplete: () => {
+                  if (earthRef.current) gsap.to(earthRef.current, { x:'0vw', scale:0.65, opacity:0.2, duration:2.8, ease:'power3.inOut' });
+                  if (welcomeRef.current) {
+                    gsap.set(welcomeRef.current, { visibility:'visible' });
+                    gsap.to(welcomeRef.current, { opacity:1, scale:1, duration:1.8, ease:'power2.out', delay:1,
+                      onComplete: () => navigate('/chat')
+                    });
+                  } else {
+                    navigate('/chat');
+                  }
+                }
+              });
+            } else {
+              navigate('/chat');
+            }
           }
         }}/>
       )}

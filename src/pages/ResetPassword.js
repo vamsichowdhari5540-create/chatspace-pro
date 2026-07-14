@@ -17,7 +17,7 @@ import React, { useState } from 'react';
 import { useSearchParams, useNavigate, Link } from 'react-router-dom';
 import axios from 'axios';
 
-const API = 'https://gong-unbend-chief.ngrok-free.dev/api';
+const API = 'https://resume-embezzle-overbill.ngrok-free.dev/api';
 
 export default function ResetPassword() {
   const [searchParams] = useSearchParams();
