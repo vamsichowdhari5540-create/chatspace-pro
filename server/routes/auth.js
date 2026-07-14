@@ -204,6 +204,21 @@ router.post('/register', async (req, res) => {
                   dbName: company.db_name,
                 }
               });
+              // Notify already-connected clients so their DM/user list picks
+              // up the new teammate live, instead of only after their next
+              // manual page refresh. companyCode is included so the client
+              // can ignore signups from a different company workspace.
+              const io = req.app.get('io');
+              if (io) {
+                io.emit('userRegistered', {
+                  id: result.insertId,
+                  username: finalUsername,
+                  avatar_color: avatar_color || '#4A90E2',
+                  avatar_url: null,
+                  status: 'online',
+                  companyCode,
+                });
+              }
             }
           );
         });
@@ -256,7 +271,7 @@ router.post('/forgot-password', async (req, res) => {
           console.error('Forgot-password token insert error:', err.message);
           return res.json(genericResponse);
         }
-        const resetUrl = `${process.env.FRONTEND_URL || 'https://gong-unbend-chief.ngrok-free.dev'}/reset-password?token=${token}&db=${encodeURIComponent(dbName)}`;
+        const resetUrl = `${process.env.FRONTEND_URL || 'https://resume-embezzle-overbill.ngrok-free.dev'}/reset-password?token=${token}&db=${encodeURIComponent(dbName)}`;
         try {
           await transporter.sendMail({
             from: `"ChatSpace Pro" <${process.env.EMAIL_USER}>`,

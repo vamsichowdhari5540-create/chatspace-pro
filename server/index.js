@@ -29,6 +29,10 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   transports: ['websocket', 'polling']
 });
+// Makes `req.app.get('io')` available inside route files, so HTTP routes
+// (like registration) can notify already-connected clients in real time
+// without needing a separate socket connection of their own.
+app.set('io', io);
 
 app.use(cors({
   origin: true,
@@ -124,7 +128,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('addReaction', (data) => {
-    const { messageId, emoji, userId, username, room } = data;
+    const { messageId, emoji, userId, username, room, toUserId } = data;
+    console.log(`👍 addReaction: msg ${messageId}, emoji ${emoji}, from ${username} (user ${userId}), room=${room || 'none'}, toUserId=${toUserId || 'none'}`);
     if (!global.reactions) global.reactions = {};
     if (!global.reactions[messageId]) global.reactions[messageId] = {};
     const msgReactions = global.reactions[messageId];
@@ -135,6 +140,10 @@ io.on('connection', (socket) => {
     if (msgReactions[emoji].length === 0) delete msgReactions[emoji];
     if (room) {
       io.to(room).emit('messageReaction', { messageId, reactions: msgReactions });
+    } else if (toUserId) {
+      const target = Object.values(onlineUsers).find(u => Number(u.id) === Number(toUserId));
+      console.log(`   → DM reaction target: ${target ? `found, relaying to socket ${target.socketId}` : '⚠️  NOT FOUND in onlineUsers'}`);
+      if (target) io.to(target.socketId).emit('messageReaction', { messageId, reactions: msgReactions });
     } else {
       io.emit('messageReaction', { messageId, reactions: msgReactions });
     }
@@ -156,6 +165,16 @@ io.on('connection', (socket) => {
       }
     });
     socket.emit('groupCreated', { group });
+  });
+
+  socket.on('memberAdded', ({ group, username }) => {
+    const target = Object.values(onlineUsers).find(u => u.username === username);
+    if (target) {
+      io.to(target.socketId).emit('memberAdded', { group });
+      console.log(`➕ Notified ${username} they were added to group "${group?.name}"`);
+    } else {
+      console.log(`➕ ${username} added to group "${group?.name}" but is offline — they'll see it on next login`);
+    }
   });
 
   socket.on('groupDeleted', ({ groupId, memberIds }) => {

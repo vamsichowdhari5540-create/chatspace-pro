@@ -390,6 +390,21 @@ export default function Chat() {
     socket.on('connect', registerOnline);
     socket.on('onlineUsers', setOnlineUsers);
     socket.on('groupCreated', () => loadGroups());
+    socket.on('userRegistered', (newUser) => {
+      // Skip signups from a different company workspace (VITS vs VEC, etc)
+      // — the socket server is shared across companies, but each person
+      // should only see teammates in their own workspace.
+      if (newUser?.companyCode && user.companyCode && newUser.companyCode !== user.companyCode) return;
+      loadUsers();
+      addToast({ title: 'New teammate joined', message: `${newUser?.username || 'Someone'} just created an account` });
+    });
+    socket.on('memberAdded', ({ group }) => {
+      // Re-fetch the full group list rather than just appending — this also
+      // re-emits joinGroup for every group, so we're actually subscribed to
+      // receive this group's live messages, not just seeing it in the list.
+      loadGroups();
+      addToast({ title: 'Added to group', message: `You've been added to "${group?.name || 'a group'}"` });
+    });
     socket.on('roleUpdated', ({ userId, role }) => {
       if (Number(userId) === Number(user.id)) {
         setUser(prev => ({ ...prev, role }));
@@ -471,7 +486,7 @@ export default function Chat() {
       if (room !== activeChannel) return;
       setTypingUsers(prev => isTyping ? [...prev.filter(u=>u!==username),username] : prev.filter(u=>u!==username));
     });
-    socket.on('messageReaction', ({ messageId, reactions:r }) => { setReactions(prev => ({...prev,[messageId]:r})); });
+    socket.on('messageReaction', ({ messageId, reactions:r }) => { console.log(`📩 [client] messageReaction received for msg ${messageId}`, r); setReactions(prev => ({...prev,[messageId]:r})); });
     socket.on('messageEdited', ({ id, text }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text,edited:1}:m)); });
     socket.on('messageDeleted', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,text:'This message was deleted',deleted:1}:m)); });
     socket.on('messageSeen', ({ id }) => { setMessages(prev => prev.map(m=>m.id===id?{...m,seen_at:new Date()}:m)); });
@@ -1103,8 +1118,17 @@ export default function Chat() {
   };
 
   const handleReaction = (msgId, emoji) => {
-    const room = activeChannel || (activeGroup ? `group_${activeGroup.id}` : `dm_${activeDM?.id}`);
-    socket.emit('addReaction', { messageId:msgId, emoji, userId:user.id, username:user.username, room });
+    // Channels and groups broadcast to a joined socket.io room, which works
+    // fine. DMs never had a real room to join in the first place — a "dm_X"
+    // room was being used but no client ever actually joins one — so a
+    // reaction in a DM silently went nowhere. Route DMs directly to the
+    // other person's socket instead, the same way DM messages already do.
+    const payload = { messageId: msgId, emoji, userId: user.id, username: user.username };
+    if (activeChannel) payload.room = activeChannel;
+    else if (activeGroup) payload.room = `group_${activeGroup.id}`;
+    else if (activeDM) payload.toUserId = activeDM.id;
+    console.log('📤 [client] emitting addReaction', payload);
+    socket.emit('addReaction', payload);
     setReactions(prev => {
       const msgReactions = { ...(prev[msgId] || {}) };
       const users = msgReactions[emoji] ? [...msgReactions[emoji]] : [];
@@ -1156,6 +1180,11 @@ export default function Chat() {
       const r = await axios.get(`${API}/groups/${activeGroup.id}/members`);
       setGroupMembersList(r.data);
       addToast({ title:'Member added!', message:`${username} added to group` });
+      // Adding a member to an EXISTING group never notified anyone live —
+      // unlike creating a brand new group, which already does this. Without
+      // this, the new member's sidebar (and their socket room membership)
+      // only updated on their next manual page refresh.
+      if (socket) socket.emit('memberAdded', { group: activeGroup, username });
     }
     catch (err) { setAdminError(err.response?.data?.message||'Failed to add member'); }
   };
